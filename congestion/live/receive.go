@@ -153,8 +153,13 @@ func (r *receiver) Flush() {
 	r.packetList = r.packetList.Init()
 }
 
-// calculateMedianCapacity returns the median of probe pair samples.
-// This is the libsrt algorithm for filtering outliers from bandwidth estimation.
+// calculateMedianCapacity returns the filtered average of probe pair samples.
+// This is the libsrt algorithm: median filter + arithmetic average of filtered values.
+// Algorithm:
+// 1. Find median of all samples
+// 2. Filter: keep only values in range [median/8, median*8]
+// 3. Calculate average of filtered values + median
+// 4. Result: 1_000_000 / average
 // Must be called with lock held.
 func (r *receiver) calculateMedianCapacity() float64 {
 	if r.probeCount == 0 {
@@ -165,14 +170,33 @@ func (r *receiver) calculateMedianCapacity() float64 {
 	samples := make([]float64, r.probeCount)
 	copy(samples, r.probeSamples[:r.probeCount])
 
-	// Sort and return median
+	// Sort to find median
 	sort.Float64s(samples)
-
 	mid := r.probeCount / 2
-	if r.probeCount%2 == 0 {
-		return (samples[mid-1] + samples[mid]) / 2
+	median := samples[mid]
+
+	// Filter range: [median/8, median*8]
+	lower := median / 8.0
+	upper := median * 8.0
+
+	// Calculate average of filtered values
+	sum := median // Start with median (libsrt includes it)
+	count := 1.0
+
+	for _, sample := range samples {
+		// Keep values in filter range (excluding median itself as we already added it)
+		if sample > lower && sample < upper && sample != median {
+			sum += sample
+			count++
+		}
 	}
-	return samples[mid]
+
+	if count == 0 {
+		return median
+	}
+
+	// Return average of filtered values
+	return sum / count
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
