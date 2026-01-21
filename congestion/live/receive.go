@@ -160,10 +160,13 @@ func (r *receiver) Push(pkt packet.Packet) {
 		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
 			// The time between packets scaled to a fully loaded packet
 			diff := float64(time.Since(r.probeTime).Microseconds()) * (packet.MAX_PAYLOAD_SIZE / float64(pkt.Len()))
-			if diff != 0 {
-				// Here we're doing an average of the measurements.
-				r.avgLinkCapacity = 0.875*r.avgLinkCapacity + 0.125*1_000_000/diff
+			// Minimum diff of 10 microseconds prevents unrealistic capacity estimates
+			// when packets arrive in bursts. 10us = max ~100k pps = ~1.1 Gbps theoretical max.
+			if diff < 10 {
+				diff = 10
 			}
+			// Here we're doing an average of the measurements.
+			r.avgLinkCapacity = 0.875*r.avgLinkCapacity + 0.125*1_000_000/diff
 		} else {
 			r.probeTime = time.Time{}
 		}
