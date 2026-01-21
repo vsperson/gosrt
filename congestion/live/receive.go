@@ -289,11 +289,10 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
-		// If there are packets that should have been delivered by now, move forward.
-		if p.Header().PktTsbpdTime <= now {
-			ackSequenceNumber = p.Header().PacketSequenceNumber
-			continue
-		}
+		// FIXED: Removed buggy time-based gap skipping.
+		// ACK must only confirm continuous sequence of received packets.
+		// The old code incorrectly skipped gaps when PktTsbpdTime <= now,
+		// causing retransmitted packets to be dropped as "already ACK'd".
 
 		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
