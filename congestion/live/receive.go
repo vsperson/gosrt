@@ -101,6 +101,7 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 	for i := range r.probeSamples {
 		r.probeSamples[i] = 1000
 	}
+	r.probeCount = probeWindowSize // Buffer is pre-filled, so it's full from the start
 
 	if r.sendACK == nil {
 		r.sendACK = func(seq circular.Number, light bool) {}
