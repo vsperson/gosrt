@@ -3,7 +3,6 @@ package live
 import (
 	"container/list"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,10 +11,6 @@ import (
 	"github.com/datarhei/gosrt/congestion"
 	"github.com/datarhei/gosrt/packet"
 )
-
-// probeWindowSize is the number of probe pair samples to keep for median filter.
-// libsrt uses median filter to discard outliers from bandwidth estimation.
-const probeWindowSize = 16
 
 // ReceiveConfig is the configuration for the liveRecv congestion control
 type ReceiveConfig struct {
@@ -44,14 +39,6 @@ type receiver struct {
 	lastPeriodicNAK uint64
 
 	avgPayloadSize float64 // bytes
-
-	// Probe pair bandwidth estimation (libsrt algorithm)
-	probeTime     int64 // nanoseconds since epoch (from PacketHeader.ArrivalTime)
-	probeNextSeq  circular.Number
-	probeSamples  []float64 // circular buffer of capacity samples (pps)
-	probeIndex    int       // current index in circular buffer
-	probeCount    int       // number of samples collected
-	linkCapacity  float64   // median-filtered link capacity (pps)
 
 	statistics congestion.ReceiveStats
 
@@ -87,21 +74,10 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
 
-		// Probe pair samples buffer for median filter (libsrt algorithm)
-		probeSamples: make([]float64, probeWindowSize),
-
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
 	}
-
-	// Initialize probe samples with 1000 microseconds (1 ms) as libsrt does.
-	// This prevents unrealistic capacity estimates when first probes arrive.
-	// 1000us = 1ms = 1000 pps = ~1.1 Gbps with full packets
-	for i := range r.probeSamples {
-		r.probeSamples[i] = 1000
-	}
-	r.probeCount = probeWindowSize // Buffer is pre-filled, so it's full from the start
 
 	if r.sendACK == nil {
 		r.sendACK = func(seq circular.Number, light bool) {}
@@ -129,13 +105,12 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
 
 	// Link capacity from probe pairs with median filter (libsrt algorithm)
-	linkCapacity := r.linkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
-
-	// Fallback: if probe pairs didn't work (losses, jitter), use receive bandwidth
-	// as a lower bound estimate. The actual link capacity is at least what we're receiving.
-	if linkCapacity < r.statistics.MbpsEstimatedRecvBandwidth {
-		linkCapacity = r.statistics.MbpsEstimatedRecvBandwidth
-	}
+	// Link capacity estimation: use receive bandwidth
+	// NOTE: Probe pair method doesn't work reliably in Go because packets are read
+	// in batches from socket buffer, giving all packets nearly identical timestamps.
+	// This requires kernel-level SO_TIMESTAMPNS support which is complex to implement.
+	// libsrt falls back to receive bandwidth in such cases.
+	linkCapacity := r.statistics.MbpsEstimatedRecvBandwidth
 
 	r.statistics.MbpsEstimatedLinkCapacity = linkCapacity
 	r.statistics.PktLossRate = r.rate.pktLossRate
@@ -149,7 +124,8 @@ func (r *receiver) PacketRate() (pps, bps, capacity float64) {
 
 	pps = r.rate.packetsPerSecond
 	bps = r.rate.bytesPerSecond
-	capacity = r.linkCapacity
+	// capacity is now based on receive bandwidth, not probe pairs
+	capacity = r.statistics.MbpsEstimatedRecvBandwidth
 
 	return
 }
@@ -161,116 +137,12 @@ func (r *receiver) Flush() {
 	r.packetList = r.packetList.Init()
 }
 
-// calculateMedianCapacity returns the bandwidth in packets-per-second.
-// This is the libsrt algorithm:
-// 1. Samples are stored as scaled intervals in microseconds
-// 2. Find median interval
-// 3. Filter: keep only intervals in range [median/8, median*8]
-// 4. Calculate average of filtered intervals + median
-// 5. Convert to packets-per-second: 1_000_000 / average_interval
-// Must be called with lock held.
-func (r *receiver) calculateMedianCapacity() float64 {
-	if r.probeCount == 0 {
-		return 0
-	}
-
-	// Copy samples (scaled intervals) for sorting
-	intervals := make([]float64, r.probeCount)
-	copy(intervals, r.probeSamples[:r.probeCount])
-
-	// Sort to find median
-	sort.Float64s(intervals)
-	mid := r.probeCount / 2
-	median := intervals[mid]
-
-	// Filter range: [median/8, median*8]
-	lower := median / 8.0
-	upper := median * 8.0
-
-	// Calculate average of filtered intervals (libsrt includes median)
-	sum := median
-	count := 1.0
-
-	for _, interval := range intervals {
-		// Keep intervals in filter range (excluding median as we already added it)
-		if interval > lower && interval < upper && interval != median {
-			sum += interval
-			count++
-		}
-	}
-
-	if count == 0 {
-		return 0
-	}
-
-	// Average interval in microseconds
-	avgInterval := sum / count
-
-	// Convert to packets per second: 1_000_000 / interval_us
-	return 1_000_000 / avgInterval
-}
-
 func (r *receiver) Push(pkt packet.Packet) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
 	if pkt == nil {
 		return
-	}
-
-	// Probe pair bandwidth estimation (libsrt algorithm).
-	// Every 16th and 17th packet are sent back-to-back as probe pairs.
-	// The receiver measures inter-arrival time, scales it by packet size, and filters outliers.
-	// libsrt stores: (interval_us * MAX_PAYLOAD_SIZE) / actual_packet_size
-	// This normalizes intervals to full-size packets.
-	if !pkt.Header().RetransmittedPacketFlag {
-		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
-		if probe == 0 {
-			// Capture arrival time from packet header (set at network receive time)
-			r.probeTime = pkt.Header().ArrivalTime
-			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
-		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && r.probeTime != 0 && pkt.Len() != 0 {
-			// Use arrival time from packet header (captured BEFORE lock, avoiding queue delays)
-			arrivalTime := pkt.Header().ArrivalTime
-			
-			// DEBUG: Check if ArrivalTime is actually set
-			if arrivalTime == 0 {
-				println("ERROR: ArrivalTime not set on packet!")
-				r.probeTime = 0
-				return
-			}
-			
-			// Measure inter-arrival time in microseconds
-			intervalUs := float64(arrivalTime-r.probeTime) / 1000.0 // nanoseconds to microseconds
-			
-			// DEBUG: Log probe measurements
-			println(fmt.Sprintf("Probe interval: %.2f us, seq=%d, pktLen=%d, capacity=%.2f Gbps", 
-				intervalUs, pkt.Header().PacketSequenceNumber.Val(), pkt.Len(),
-				(1_000_000/intervalUs)*float64(packet.MAX_PAYLOAD_SIZE)*8/1024/1024/1000))
-			
-			// With accurate arrival timestamps, all intervals should be realistic
-			if intervalUs > 0 {
-				// Scale interval by packet size (libsrt algorithm)
-				// stored_interval = interval * MAX_PAYLOAD_SIZE / actual_packet_size
-				scaledInterval := intervalUs * float64(packet.MAX_PAYLOAD_SIZE) / float64(pkt.Len())
-
-				// Store scaled interval (NOT packets-per-second)
-				r.probeSamples[r.probeIndex] = scaledInterval
-				r.probeIndex = (r.probeIndex + 1) % probeWindowSize
-				if r.probeCount < probeWindowSize {
-					r.probeCount++
-				}
-
-				// Calculate bandwidth from filtered average of intervals
-				r.linkCapacity = r.calculateMedianCapacity()
-			}
-			
-			r.probeTime = 0
-		} else {
-			r.probeTime = 0
-		}
-	} else {
-		r.probeTime = 0
 	}
 
 	r.nPackets++
