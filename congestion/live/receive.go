@@ -46,7 +46,7 @@ type receiver struct {
 	avgPayloadSize float64 // bytes
 
 	// Probe pair bandwidth estimation (libsrt algorithm)
-	probeTime     time.Time
+	probeTime     int64 // nanoseconds since epoch (from PacketHeader.ArrivalTime)
 	probeNextSeq  circular.Number
 	probeSamples  []float64 // circular buffer of capacity samples (pps)
 	probeIndex    int       // current index in circular buffer
@@ -226,26 +226,18 @@ func (r *receiver) Push(pkt packet.Packet) {
 	if !pkt.Header().RetransmittedPacketFlag {
 		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
 		if probe == 0 {
-			// Capture arrival time IMMEDIATELY (libsrt does this to avoid delays from locks)
-			r.probeTime = time.Now()
+			// Capture arrival time from packet header (set at network receive time)
+			r.probeTime = pkt.Header().ArrivalTime
 			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
-		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
-			// Capture arrival time IMMEDIATELY before any processing
-			now := time.Now()
+		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && r.probeTime != 0 && pkt.Len() != 0 {
+			// Use arrival time from packet header (captured BEFORE lock, avoiding queue delays)
+			arrivalTime := pkt.Header().ArrivalTime
 			
 			// Measure inter-arrival time in microseconds
-			intervalUs := float64(now.Sub(r.probeTime).Microseconds())
+			intervalUs := float64(arrivalTime-r.probeTime) / 1000.0 // nanoseconds to microseconds
 			
-			// CRITICAL FIX: We measure time AFTER acquiring lock, which means we're measuring
-			// queue processing time, not network arrival time. This gives intervals of 1-14us
-			// instead of realistic 30-50us for 200-300 Mbps networks.
-			//
-			// libsrt solves this by capturing time BEFORE lock (window.h:301).
-			// As a workaround, reject unrealistically short intervals (< 20us).
-			// At 300 Mbps with 1316-byte packets: interval should be ~35us minimum.
-			const minRealisticInterval = 20.0 // microseconds
-			
-			if intervalUs >= minRealisticInterval {
+			// With accurate arrival timestamps, all intervals should be realistic
+			if intervalUs > 0 {
 				// Scale interval by packet size (libsrt algorithm)
 				// stored_interval = interval * MAX_PAYLOAD_SIZE / actual_packet_size
 				scaledInterval := intervalUs * float64(packet.MAX_PAYLOAD_SIZE) / float64(pkt.Len())
@@ -260,14 +252,13 @@ func (r *receiver) Push(pkt packet.Packet) {
 				// Calculate bandwidth from filtered average of intervals
 				r.linkCapacity = r.calculateMedianCapacity()
 			}
-			// else: ignore unrealistic short intervals caused by queue processing delays
 			
-			r.probeTime = time.Time{}
+			r.probeTime = 0
 		} else {
-			r.probeTime = time.Time{}
+			r.probeTime = 0
 		}
 	} else {
-		r.probeTime = time.Time{}
+		r.probeTime = 0
 	}
 
 	r.nPackets++

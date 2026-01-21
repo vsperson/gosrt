@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/datarhei/gosrt/circular"
 	srtnet "github.com/datarhei/gosrt/net"
@@ -222,6 +223,7 @@ type PacketHeader struct {
 	Addr            net.Addr
 	IsControlPacket bool
 	PktTsbpdTime    uint64 // microseconds
+	ArrivalTime     int64  // nanoseconds since epoch, captured at network receive
 
 	// control packet fields
 
@@ -279,6 +281,9 @@ var payloadPool *pool = newPool()
 
 func NewPacketFromData(addr net.Addr, rawdata []byte) (Packet, error) {
 	p := NewPacket(addr)
+	
+	// Capture arrival time IMMEDIATELY for accurate bandwidth estimation (libsrt algorithm)
+	p.Header().ArrivalTime = time.Now().UnixNano()
 
 	if len(rawdata) != 0 {
 		if err := p.Unmarshal(rawdata); err != nil {
