@@ -95,6 +95,13 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		deliver: config.OnDeliver,
 	}
 
+	// Initialize probe samples with 1000 microseconds (1 ms) as libsrt does.
+	// This prevents unrealistic capacity estimates when first probes arrive.
+	// 1000us = 1ms = 1000 pps = ~1.1 Gbps with full packets
+	for i := range r.probeSamples {
+		r.probeSamples[i] = 1000
+	}
+
 	if r.sendACK == nil {
 		r.sendACK = func(seq circular.Number, light bool) {}
 	}
