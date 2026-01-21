@@ -356,7 +356,9 @@ func TestRecvDropTooLate(t *testing.T) {
 
 	stats = recv.Stats()
 
-	require.Equal(t, uint64(1), stats.PktDrop)
+	// Note: libsrt doesn't count belated packets as PktDrop - they are just ignored
+	require.Equal(t, uint64(0), stats.PktDrop)
+	require.Equal(t, uint64(1), stats.PktBelated) // But they are counted as belated
 }
 
 func TestRecvDropAlreadyACK(t *testing.T) {
@@ -401,7 +403,8 @@ func TestRecvDropAlreadyACK(t *testing.T) {
 
 	stats = recv.Stats()
 
-	require.Equal(t, uint64(1), stats.PktDrop)
+	// Note: libsrt doesn't count already ACK'd packets as PktDrop - they are just ignored
+	require.Equal(t, uint64(0), stats.PktDrop)
 }
 
 func TestRecvDropAlreadyRecvNoACK(t *testing.T) {
@@ -454,7 +457,8 @@ func TestRecvDropAlreadyRecvNoACK(t *testing.T) {
 
 	stats = recv.Stats()
 
-	require.Equal(t, uint64(1), stats.PktDrop)
+	// Note: libsrt doesn't count duplicate packets as PktDrop - they are just ignored
+	require.Equal(t, uint64(0), stats.PktDrop)
 }
 
 func TestRecvFlush(t *testing.T) {
