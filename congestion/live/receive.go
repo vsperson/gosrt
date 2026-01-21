@@ -186,6 +186,7 @@ func (r *receiver) Push(pkt packet.Packet) {
 	// Probe pair bandwidth estimation (libsrt algorithm).
 	// Every 16th and 17th packet are sent back-to-back as probe pairs.
 	// The receiver measures inter-arrival time and uses MEDIAN FILTER to discard outliers.
+	// Formula: capacity_pps = 1_000_000 / interval_us (packets per second)
 	// See: https://srtlab.github.io/srt-cookbook/protocol/bandwidth-estimation.html
 	if !pkt.Header().RetransmittedPacketFlag {
 		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
@@ -193,11 +194,11 @@ func (r *receiver) Push(pkt packet.Packet) {
 			r.probeTime = time.Now()
 			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
 		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
-			// Measure inter-arrival time scaled to full packet size
-			diff := float64(time.Since(r.probeTime).Microseconds()) * (packet.MAX_PAYLOAD_SIZE / float64(pkt.Len()))
-			if diff > 0 {
-				// Calculate capacity sample: packets per second
-				sample := 1_000_000 / diff
+			// Measure inter-arrival time in microseconds
+			intervalUs := float64(time.Since(r.probeTime).Microseconds())
+			if intervalUs > 0 {
+				// Calculate capacity: packets per second
+				sample := 1_000_000 / intervalUs
 
 				// Add sample to circular buffer
 				r.probeSamples[r.probeIndex] = sample
