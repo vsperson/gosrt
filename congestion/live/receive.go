@@ -17,6 +17,7 @@ type ReceiveConfig struct {
 	InitialSequenceNumber circular.Number
 	PeriodicACKInterval   uint64 // microseconds
 	PeriodicNAKInterval   uint64 // microseconds
+	ReorderTolerance      uint32 // packets
 	OnSendACK             func(seq circular.Number, light bool)
 	OnSendNAK             func(list []circular.Number)
 	OnDeliver             func(p packet.Packet)
@@ -34,12 +35,19 @@ type receiver struct {
 
 	periodicACKInterval uint64 // config
 	periodicNAKInterval uint64 // config
+	reorderTolerance    uint32 // config
 
 	lastPeriodicACK uint64
 	lastPeriodicNAK uint64
 
-	avgPayloadSize float64 // bytes
+	avgPayloadSize  float64 // bytes
 	maxLinkCapacity float64 // Mbps, tracks maximum observed receive bandwidth
+
+	// Link Capacity Probing
+	lastProbeTime  time.Time
+	lastProbeSeq   circular.Number
+	probeSamples   []float64
+	probeSampleIdx int
 
 	statistics congestion.ReceiveStats
 
@@ -72,12 +80,15 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		periodicACKInterval: config.PeriodicACKInterval,
 		periodicNAKInterval: config.PeriodicNAKInterval,
+		reorderTolerance:    config.ReorderTolerance,
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
 
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
+
+		probeSamples: make([]float64, 16), // Store last 16 samples for median filtering
 	}
 
 	if r.sendACK == nil {
@@ -106,14 +117,43 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
 
 	// Link capacity from probe pairs with median filter (libsrt algorithm)
-	// Link capacity estimation: use maximum observed receive bandwidth
-	// NOTE: Probe pair method doesn't work reliably in Go because packets are read
-	// in batches from socket buffer, giving all packets nearly identical timestamps.
-	// This requires kernel-level SO_TIMESTAMPNS support which is complex to implement.
-	// libsrt falls back to receive bandwidth in such cases.
-	//
-	// Track maximum bandwidth to represent channel capacity (not current utilization)
-	if r.statistics.MbpsEstimatedRecvBandwidth > r.maxLinkCapacity {
+	// We use the probeSamples collected in Push() to estimate capacity.
+	// If no samples (e.g. buffered socket), fallback to max observed bandwidth.
+	
+	// Calculate median of probe samples
+	var medianCapacity float64
+	if len(r.probeSamples) > 0 && r.probeSamples[0] > 0 {
+		// Copy samples to avoid sorting the ring buffer
+		sorted := make([]float64, len(r.probeSamples))
+		copy(sorted, r.probeSamples)
+		// Simple bubble sort for small array
+		for i := 0; i < len(sorted); i++ {
+			for j := i + 1; j < len(sorted); j++ {
+				if sorted[i] > sorted[j] {
+					sorted[i], sorted[j] = sorted[j], sorted[i]
+				}
+			}
+		}
+		// Count non-zero samples
+		count := 0
+		for _, v := range sorted {
+			if v > 0 {
+				count++
+			}
+		}
+		
+		if count > 0 {
+			// Get median of non-zero samples
+			// The zeros are at the beginning because we sorted ascending
+			startIdx := len(sorted) - count
+			medianCapacity = sorted[startIdx + count/2]
+		}
+	}
+
+	// If probe estimation works, use it. Otherwise fallback to max bandwidth.
+	if medianCapacity > r.statistics.MbpsEstimatedRecvBandwidth {
+		r.maxLinkCapacity = medianCapacity
+	} else if r.statistics.MbpsEstimatedRecvBandwidth > r.maxLinkCapacity {
 		r.maxLinkCapacity = r.statistics.MbpsEstimatedRecvBandwidth
 	}
 	
@@ -214,16 +254,24 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 		return
 	} else {
-		// Too far ahead, there are some missing sequence numbers, immediate NAK report
-		// here we can prevent a possibly unnecessary NAK with SRTO_LOXXMAXTTL
-		r.sendNAK([]circular.Number{
-			r.maxSeenSequenceNumber.Inc(),
-			pkt.Header().PacketSequenceNumber.Dec(),
-		})
+		// Too far ahead, there are some missing sequence numbers.
+		// Check reorder tolerance before declaring loss.
+		
+		dist := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
+		
+		// Only send NAK and count loss if distance > ReorderTolerance
+		if dist > uint64(r.reorderTolerance) {
+			r.sendNAK([]circular.Number{
+				r.maxSeenSequenceNumber.Inc(),
+				pkt.Header().PacketSequenceNumber.Dec(),
+			})
 
-		len := uint64(pkt.Header().PacketSequenceNumber.Distance(r.maxSeenSequenceNumber))
-		r.statistics.PktLoss += len
-		r.statistics.ByteLoss += len * uint64(r.avgPayloadSize)
+			r.statistics.PktLoss += dist
+			r.statistics.ByteLoss += dist * uint64(r.avgPayloadSize)
+		}
+		// If within tolerance, we don't NAK immediately. 
+		// periodicNAK will pick it up if it stays missing.
+		// And we don't increment PktLoss yet (wait for periodicNAK or TLPKTDROP).
 
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	}
@@ -233,6 +281,41 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 	r.statistics.ByteBuf += pktLen
 	r.statistics.ByteUnique += pktLen
+
+	// Probe Packet Logic for Link Capacity Estimation
+	// Probe packets are sent every 16 packets. Pairs are (0, 1), (16, 17), etc.
+	// We measure the time difference between the arrival of the pair.
+	seqVal := pkt.Header().PacketSequenceNumber.Val()
+	probeSeq := seqVal & 0xF
+	
+	if probeSeq == 0 {
+		r.lastProbeTime = time.Now()
+		r.lastProbeSeq = pkt.Header().PacketSequenceNumber
+	} else if probeSeq == 1 {
+		// Check if this is the pair of the last probe
+		if pkt.Header().PacketSequenceNumber.Equals(r.lastProbeSeq.Inc()) {
+			now := time.Now()
+			delta := now.Sub(r.lastProbeTime)
+			
+			// Filter out buffered packets (delta too small)
+			// 10us is arbitrary but filters out "instant" reads from buffer
+			// At 10Gbps, 1500 bytes take ~1.2us. At 1Gbps ~12us.
+			// If we see < 1us, it's definitely buffered.
+			// Go's time resolution might be limited.
+			if delta > 1 * time.Microsecond {
+				// Calculate Mbps
+				mbps := float64(pktLen*8) / delta.Seconds() / 1e6
+				
+				// Sanity check: ignore unrealistic values (e.g. > 100Gbps)
+				if mbps < 100000 {
+					if len(r.probeSamples) > 0 {
+						r.probeSamples[r.probeSampleIdx] = mbps
+						r.probeSampleIdx = (r.probeSampleIdx + 1) % len(r.probeSamples)
+					}
+				}
+			}
+		}
+	}
 
 	r.packetList.PushBack(pkt)
 }
@@ -250,16 +333,9 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		}
 	}
 
-	minPktTsbpdTime, maxPktTsbpdTime := uint64(0), uint64(0)
 	ackSequenceNumber := r.lastACKSequenceNumber
 
 	e := r.packetList.Front()
-	if e != nil {
-		p := e.Value.(packet.Packet)
-
-		minPktTsbpdTime = p.Header().PktTsbpdTime
-		maxPktTsbpdTime = p.Header().PktTsbpdTime
-	}
 
 	// Find the sequence number up until we have all in a row.
 	// Where the first gap is (or at the end of the list) is where we can ACK to.
@@ -277,7 +353,6 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
-			maxPktTsbpdTime = p.Header().PktTsbpdTime
 			continue
 		}
 
@@ -288,7 +363,6 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		if p.Header().PktTsbpdTime <= now {
 			// Skip the gap and continue with this packet
 			ackSequenceNumber = p.Header().PacketSequenceNumber
-			maxPktTsbpdTime = p.Header().PktTsbpdTime
 			continue
 		}
 
@@ -306,7 +380,16 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 	r.lastPeriodicACK = now
 	r.nPackets = 0
 
-	r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
+	// Calculate MsBuf based on the entire packet list (first to last),
+	// similar to libsrt's getRcvDataSize/getTimespan_ms.
+	// This includes gaps/missing packets in the timespan.
+	if r.packetList.Len() > 0 {
+		first := r.packetList.Front().Value.(packet.Packet)
+		last := r.packetList.Back().Value.(packet.Packet)
+		r.statistics.MsBuf = (last.Header().PktTsbpdTime - first.Header().PktTsbpdTime) / 1_000
+	} else {
+		r.statistics.MsBuf = 0
+	}
 
 	return
 }
