@@ -107,7 +107,17 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 
 	r.statistics.BytePayload = uint64(r.avgPayloadSize)
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
-	r.statistics.MbpsEstimatedLinkCapacity = r.avgLinkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
+
+	// Link capacity from probe pairs measurement
+	linkCapacity := r.avgLinkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
+
+	// Fallback: if probe pairs didn't work (losses, jitter), use receive bandwidth
+	// as a lower bound estimate. The actual link capacity is at least what we're receiving.
+	if linkCapacity < r.statistics.MbpsEstimatedRecvBandwidth {
+		linkCapacity = r.statistics.MbpsEstimatedRecvBandwidth
+	}
+
+	r.statistics.MbpsEstimatedLinkCapacity = linkCapacity
 	r.statistics.PktLossRate = r.rate.pktLossRate
 
 	return r.statistics
@@ -301,11 +311,11 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		// There's a gap. Check if the packet's delivery time has passed (TLPKTDROP).
 		// If so, virtually drop the missing packets and continue.
 		if p.Header().PktTsbpdTime <= now {
-			// Calculate how many packets are missing
+			// Calculate how many packets are missing (for drop stats only).
+			// Note: PktLoss is already counted in Push() when the gap is detected,
+			// here we only count PktDrop for packets that were not recovered in time.
 			nMissing := uint64(p.Header().PacketSequenceNumber.Distance(ackSequenceNumber.Inc()))
 			if nMissing > 0 {
-				r.statistics.PktLoss += nMissing
-				r.statistics.ByteLoss += nMissing * uint64(r.avgPayloadSize)
 				r.statistics.PktDrop += nMissing
 				r.statistics.ByteDrop += nMissing * uint64(r.avgPayloadSize)
 			}
