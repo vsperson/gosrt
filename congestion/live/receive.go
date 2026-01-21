@@ -272,17 +272,13 @@ func (r *receiver) Push(pkt packet.Packet) {
 		r.statistics.PktBelated++
 		r.statistics.ByteBelated += pktLen
 
-		r.statistics.PktDrop++
-		r.statistics.ByteDrop += pktLen
-
+		// Note: libsrt does NOT count this as PktDrop - packet is just ignored
 		return
 	}
 
 	if pkt.Header().PacketSequenceNumber.Lt(r.lastACKSequenceNumber) {
 		// Already acknowledged, ignoring
-		r.statistics.PktDrop++
-		r.statistics.ByteDrop += pktLen
-
+		// Note: libsrt does NOT count this as PktDrop - packet is just ignored
 		return
 	}
 
@@ -296,9 +292,7 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
 				// Already received (has been sent more than once), ignoring
-				r.statistics.PktDrop++
-				r.statistics.ByteDrop += pktLen
-
+				// Note: libsrt does NOT count duplicates as PktDrop
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
 				// Late arrival, this fills a gap
@@ -384,16 +378,10 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		}
 
 		// There's a gap. Check if the packet's delivery time has passed (TLPKTDROP).
-		// If so, virtually drop the missing packets and continue.
+		// If so, skip the gap and continue ACK'ing.
+		// Note: Don't count as PktDrop here - if packets arrive later via retransmit,
+		// they will be delivered. Real drops are only when packets never arrive.
 		if p.Header().PktTsbpdTime <= now {
-			// Calculate how many packets are missing (for drop stats only).
-			// Note: PktLoss is already counted in Push() when the gap is detected,
-			// here we only count PktDrop for packets that were not recovered in time.
-			nMissing := uint64(p.Header().PacketSequenceNumber.Distance(ackSequenceNumber.Inc()))
-			if nMissing > 0 {
-				r.statistics.PktDrop += nMissing
-				r.statistics.ByteDrop += nMissing * uint64(r.avgPayloadSize)
-			}
 			// Skip the gap and continue with this packet
 			ackSequenceNumber = p.Header().PacketSequenceNumber
 			maxPktTsbpdTime = p.Header().PktTsbpdTime
@@ -468,23 +456,44 @@ func (r *receiver) Tick(now uint64) {
 		r.sendNAK(list)
 	}
 
-	// Deliver packets whose PktTsbpdTime is ripe
+	// Deliver packets whose PktTsbpdTime is ripe.
+	// Note: libsrt doesn't count TLPKTDROP as PktDrop in statistics - only real drops
+	// (packets that never arrived) are counted.
 	r.lock.Lock()
 	removeList := make([]*list.Element, 0, r.packetList.Len())
+	expectedSeq := r.lastDeliveredSequenceNumber.Inc()
+
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
-			r.statistics.PktBuf--
-			r.statistics.ByteBuf -= p.Len()
-
-			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
-
-			r.deliver(p)
-			removeList = append(removeList, e)
-		} else {
+		// Check if this packet is ready for delivery (TSBPD)
+		if p.Header().PktTsbpdTime > now {
+			// Not ready yet, stop processing
 			break
 		}
+
+		// Packet is ready for delivery. Check if there's a gap before it.
+		if !p.Header().PacketSequenceNumber.Equals(expectedSeq) {
+			// There's a gap. TLPKTDROP: skip missing packets and continue delivery.
+			// Note: Don't count as PktDrop - missing packets may arrive later via retransmit.
+			// Update sequence numbers to skip the gap.
+			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber.Dec()
+			if r.lastACKSequenceNumber.Lt(p.Header().PacketSequenceNumber.Dec()) {
+				r.lastACKSequenceNumber = p.Header().PacketSequenceNumber.Dec()
+			}
+		}
+
+		// Deliver the packet
+		r.statistics.PktBuf--
+		r.statistics.ByteBuf -= p.Len()
+
+		r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
+
+		r.deliver(p)
+		removeList = append(removeList, e)
+
+		// Update expected sequence for next iteration
+		expectedSeq = p.Header().PacketSequenceNumber.Inc()
 	}
 
 	for _, e := range removeList {
