@@ -226,11 +226,22 @@ func (r *receiver) Push(pkt packet.Packet) {
 	if !pkt.Header().RetransmittedPacketFlag {
 		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
 		if probe == 0 {
+			// Capture arrival time IMMEDIATELY (libsrt does this to avoid delays from locks)
 			r.probeTime = time.Now()
 			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
 		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
+			// Capture arrival time IMMEDIATELY before any processing
+			now := time.Now()
+			
 			// Measure inter-arrival time in microseconds
-			intervalUs := float64(time.Since(r.probeTime).Microseconds())
+			intervalUs := float64(now.Sub(r.probeTime).Microseconds())
+			
+			// DEBUG: Log probe measurements to understand what's happening
+			if intervalUs < 100 { // Less than 100us is suspicious for network packets
+				println(fmt.Sprintf("WARNING: Very short probe interval: %.2f us, seq=%d, pktLen=%d", 
+					intervalUs, pkt.Header().PacketSequenceNumber.Val(), pkt.Len()))
+			}
+			
 			if intervalUs > 0 {
 				// Scale interval by packet size (libsrt algorithm)
 				// stored_interval = interval * MAX_PAYLOAD_SIZE / actual_packet_size
@@ -245,6 +256,12 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 				// Calculate bandwidth from filtered average of intervals
 				r.linkCapacity = r.calculateMedianCapacity()
+				
+				// DEBUG: Log capacity calculation
+				if r.linkCapacity > 1500 { // > 1500 pps = ~1.5 Gbps is suspicious
+					println(fmt.Sprintf("WARNING: High link capacity: %.2f pps (%.2f Gbps), interval=%.2f us", 
+						r.linkCapacity, r.linkCapacity*packet.MAX_PAYLOAD_SIZE*8/1024/1024/1000, intervalUs))
+				}
 			}
 			r.probeTime = time.Time{}
 		} else {
