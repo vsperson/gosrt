@@ -280,6 +280,8 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 
 	// Find the sequence number up until we have all in a row.
 	// Where the first gap is (or at the end of the list) is where we can ACK to.
+	// TLPKTDROP: If there are gaps and the next packet's delivery time has passed,
+	// virtually drop the missing packets and continue.
 
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
@@ -289,11 +291,6 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
-		// FIXED: Removed buggy time-based gap skipping.
-		// ACK must only confirm continuous sequence of received packets.
-		// The old code incorrectly skipped gaps when PktTsbpdTime <= now,
-		// causing retransmitted packets to be dropped as "already ACK'd".
-
 		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
@@ -301,6 +298,24 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
+		// There's a gap. Check if the packet's delivery time has passed (TLPKTDROP).
+		// If so, virtually drop the missing packets and continue.
+		if p.Header().PktTsbpdTime <= now {
+			// Calculate how many packets are missing
+			nMissing := uint64(p.Header().PacketSequenceNumber.Distance(ackSequenceNumber.Inc()))
+			if nMissing > 0 {
+				r.statistics.PktLoss += nMissing
+				r.statistics.ByteLoss += nMissing * uint64(r.avgPayloadSize)
+				r.statistics.PktDrop += nMissing
+				r.statistics.ByteDrop += nMissing * uint64(r.avgPayloadSize)
+			}
+			// Skip the gap and continue with this packet
+			ackSequenceNumber = p.Header().PacketSequenceNumber
+			maxPktTsbpdTime = p.Header().PktTsbpdTime
+			continue
+		}
+
+		// Delivery time hasn't passed, stop here
 		break
 	}
 
