@@ -172,6 +172,24 @@ type Config struct {
 
 	// if a new IP starts sending data on an existing socket id, allow it
 	AllowPeerIpChange bool
+
+	// ReadQueueSize specifies the size of the read queue buffer (packets).
+	// Default: 1024, Recommended: 8192-16384 for high-bitrate streams
+	ReadQueueSize int
+
+	// NetworkQueueSize specifies the size of the network queue buffer (packets).
+	// Default: 1024, Recommended: 2048-4096
+	NetworkQueueSize int
+
+	// WriteQueueSize specifies the size of the write queue buffer (packets).
+	// Default: 1024
+	WriteQueueSize int
+
+	// BlockOnFullQueue controls behavior when queues are full.
+	// If true: block until space is available (prevents drops, may cause latency)
+	// If false: drop packet immediately (current behavior)
+	// Default: false (for backward compatibility)
+	BlockOnFullQueue bool
 }
 
 // DefaultConfig is the default configuration for a SRT connection
@@ -213,6 +231,10 @@ var defaultConfig Config = Config{
 	TransmissionType:      "live",
 	TSBPDMode:             true,
 	AllowPeerIpChange:     false,
+	ReadQueueSize:         1024,
+	NetworkQueueSize:      1024,
+	WriteQueueSize:        1024,
+	BlockOnFullQueue:      false,
 }
 
 // DefaultConfig returns the default configuration for Dial and Listen.
@@ -473,6 +495,33 @@ func (c *Config) UnmarshalQuery(query string) error {
 		}
 	}
 
+	if s := v.Get("readqueuesize"); len(s) != 0 {
+		if d, err := strconv.Atoi(s); err == nil {
+			c.ReadQueueSize = d
+		}
+	}
+
+	if s := v.Get("networkqueuesize"); len(s) != 0 {
+		if d, err := strconv.Atoi(s); err == nil {
+			c.NetworkQueueSize = d
+		}
+	}
+
+	if s := v.Get("writequeuesize"); len(s) != 0 {
+		if d, err := strconv.Atoi(s); err == nil {
+			c.WriteQueueSize = d
+		}
+	}
+
+	if s := v.Get("blockonfullqueue"); len(s) != 0 {
+		switch s {
+		case "yes", "on", "true", "1":
+			c.BlockOnFullQueue = true
+		case "no", "off", "false", "0":
+			c.BlockOnFullQueue = false
+		}
+	}
+
 	return nil
 }
 
@@ -625,6 +674,22 @@ func (c *Config) MarshalQuery() string {
 
 	if c.TSBPDMode != defaultConfig.TSBPDMode {
 		q.Set("tsbpdmode", strconv.FormatBool(c.TSBPDMode))
+	}
+
+	if c.ReadQueueSize != defaultConfig.ReadQueueSize {
+		q.Set("readqueuesize", strconv.Itoa(c.ReadQueueSize))
+	}
+
+	if c.NetworkQueueSize != defaultConfig.NetworkQueueSize {
+		q.Set("networkqueuesize", strconv.Itoa(c.NetworkQueueSize))
+	}
+
+	if c.WriteQueueSize != defaultConfig.WriteQueueSize {
+		q.Set("writequeuesize", strconv.Itoa(c.WriteQueueSize))
+	}
+
+	if c.BlockOnFullQueue != defaultConfig.BlockOnFullQueue {
+		q.Set("blockonfullqueue", strconv.FormatBool(c.BlockOnFullQueue))
 	}
 
 	return q.Encode()

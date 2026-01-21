@@ -132,6 +132,8 @@ type connStats struct {
 	pktSentShutdown   uint64
 	pktRecvShutdown   uint64
 	mbpsLinkCapacity  float64
+	pktQueueDrop      uint64 // Packets dropped due to full queues
+	byteQueueDrop     uint64 // Bytes dropped due to full queues
 }
 
 // Check if we implement the net.Conn interface
@@ -279,9 +281,17 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		rttVar: float64((50 * time.Millisecond).Microseconds()),
 	}
 
-	c.networkQueue = make(chan packet.Packet, 1024)
+	networkQueueSize := c.config.NetworkQueueSize
+	if networkQueueSize <= 0 {
+		networkQueueSize = 1024
+	}
+	c.networkQueue = make(chan packet.Packet, networkQueueSize)
 
-	c.writeQueue = make(chan packet.Packet, 1024)
+	writeQueueSize := c.config.WriteQueueSize
+	if writeQueueSize <= 0 {
+		writeQueueSize = 1024
+	}
+	c.writeQueue = make(chan packet.Packet, writeQueueSize)
 	if c.version == 4 {
 		// libsrt-1.2.3 receiver doesn't like it when the payload is larger than 7*188 bytes.
 		// Here we just take a multiple of a mpegts chunk size.
@@ -291,7 +301,11 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		c.writeData = make([]byte, int(c.config.PayloadSize))
 	}
 
-	c.readQueue = make(chan packet.Packet, 1024)
+	readQueueSize := c.config.ReadQueueSize
+	if readQueueSize <= 0 {
+		readQueueSize = 1024
+	}
+	c.readQueue = make(chan packet.Packet, readQueueSize)
 
 	c.peerIdleTimeout = time.AfterFunc(c.config.PeerIdleTimeout, func() {
 		c.log("connection:close", func() string {
@@ -516,12 +530,24 @@ func (c *srtConn) Write(b []byte) (int, error) {
 
 // push puts a packet on the network queue. This is where packets go that came in from the network.
 func (c *srtConn) push(p packet.Packet) {
-	// Non-blocking write to the network queue
-	select {
-	case <-c.ctx.Done():
-	case c.networkQueue <- p:
-	default:
-		c.log("connection:error", func() string { return "network queue is full" })
+	if c.config.BlockOnFullQueue {
+		// Blocking write - wait for space, prevents drops
+		select {
+		case <-c.ctx.Done():
+		case c.networkQueue <- p:
+		}
+	} else {
+		// Non-blocking write to the network queue
+		select {
+		case <-c.ctx.Done():
+		case c.networkQueue <- p:
+		default:
+			c.statisticsLock.Lock()
+			c.statistics.pktQueueDrop++
+			c.statistics.byteQueueDrop += p.Len()
+			c.statisticsLock.Unlock()
+			c.log("connection:error", func() string { return "network queue is full" })
+		}
 	}
 }
 
@@ -621,12 +647,25 @@ func (c *srtConn) writeQueueReader(ctx context.Context) {
 
 // deliver writes the packets to the read queue in order to be consumed by the Read function.
 func (c *srtConn) deliver(p packet.Packet) {
-	// Non-blocking write to the read queue
-	select {
-	case <-c.ctx.Done():
-	case c.readQueue <- p:
-	default:
-		c.log("connection:error", func() string { return "readQueue was blocking, dropping packet" })
+	if c.config.BlockOnFullQueue {
+		// Blocking write - wait for space, prevents drops
+		select {
+		case <-c.ctx.Done():
+			return
+		case c.readQueue <- p:
+		}
+	} else {
+		// Non-blocking write to the read queue
+		select {
+		case <-c.ctx.Done():
+		case c.readQueue <- p:
+		default:
+			c.statisticsLock.Lock()
+			c.statistics.pktQueueDrop++
+			c.statistics.byteQueueDrop += p.Len()
+			c.statisticsLock.Unlock()
+			c.log("connection:error", func() string { return "readQueue was blocking, dropping packet" })
+		}
 	}
 }
 
@@ -1464,6 +1503,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		PktSendDrop:       send.PktDrop,
 		PktRecvDrop:       recv.PktDrop,
 		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
+		PktQueueDrop:      c.statistics.pktQueueDrop,
 		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
 		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
 		ByteSentUnique:    send.ByteUnique + (send.PktUnique * c.statistics.headerSize),
@@ -1474,6 +1514,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),
 		ByteRecvDrop:      recv.ByteDrop + (recv.PktDrop * c.statistics.headerSize),
 		ByteRecvUndecrypt: c.statistics.byteRecvUndecrypt + (c.statistics.pktRecvUndecrypt * c.statistics.headerSize),
+		ByteQueueDrop:     c.statistics.byteQueueDrop + (c.statistics.pktQueueDrop * c.statistics.headerSize),
 	}
 
 	// Interval

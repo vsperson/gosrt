@@ -183,7 +183,7 @@ func Dial(network, address string, config Config) (Conn, error) {
 	timer := time.AfterFunc(dl.config.ConnectionTimeout, func() {
 		dl.connChan <- connResponse{
 			conn: nil,
-			err:  fmt.Errorf("connection timeout. server didn't respond"),
+			err:  NewTimeoutError("server didn't respond"),
 		}
 	})
 
@@ -305,7 +305,7 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 		if cif.Version < 4 || cif.Version > 5 {
 			dl.connChan <- connResponse{
 				conn: nil,
-				err:  fmt.Errorf("peer responded with unsupported handshake version (%d)", cif.Version),
+				err:  NewVersionMismatchError(fmt.Sprintf("peer responded with unsupported handshake version (%d)", cif.Version)),
 			}
 
 			return
@@ -340,7 +340,7 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 			if err != nil {
 				dl.connChan <- connResponse{
 					conn: nil,
-					err:  fmt.Errorf("failed creating crypto context: %w", err),
+					err:  NewCryptoError("failed creating crypto context", err),
 				}
 			}
 
@@ -355,7 +355,7 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 			if cif.ExtensionField != 0x4A17 {
 				dl.connChan <- connResponse{
 					conn: nil,
-					err:  fmt.Errorf("peer sent the wrong magic number"),
+					err:  NewHandshakeError("peer sent the wrong magic number", nil),
 				}
 
 				return
@@ -415,7 +415,7 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 		if cif.Version < 4 || cif.Version > 5 {
 			dl.connChan <- connResponse{
 				conn: nil,
-				err:  fmt.Errorf("peer responded with unsupported handshake version (%d)", cif.Version),
+				err:  NewVersionMismatchError(fmt.Sprintf("peer responded with unsupported handshake version (%d)", cif.Version)),
 			}
 
 			return
@@ -527,9 +527,9 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 		var err error
 
 		if cif.HandshakeType.IsRejection() {
-			err = fmt.Errorf("connection rejected: %s", cif.HandshakeType.String())
+			err = NewRejectionError(cif.HandshakeType.String())
 		} else {
-			err = fmt.Errorf("unsupported handshake: %s", cif.HandshakeType.String())
+			err = NewHandshakeError(fmt.Sprintf("unsupported handshake: %s", cif.HandshakeType.String()), nil)
 		}
 
 		dl.connChan <- connResponse{
