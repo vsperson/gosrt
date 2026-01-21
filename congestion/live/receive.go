@@ -233,8 +233,20 @@ func (r *receiver) Push(pkt packet.Packet) {
 			// Use arrival time from packet header (captured BEFORE lock, avoiding queue delays)
 			arrivalTime := pkt.Header().ArrivalTime
 			
+			// DEBUG: Check if ArrivalTime is actually set
+			if arrivalTime == 0 {
+				println("ERROR: ArrivalTime not set on packet!")
+				r.probeTime = 0
+				return
+			}
+			
 			// Measure inter-arrival time in microseconds
 			intervalUs := float64(arrivalTime-r.probeTime) / 1000.0 // nanoseconds to microseconds
+			
+			// DEBUG: Log probe measurements
+			println(fmt.Sprintf("Probe interval: %.2f us, seq=%d, pktLen=%d, capacity=%.2f Gbps", 
+				intervalUs, pkt.Header().PacketSequenceNumber.Val(), pkt.Len(),
+				(1_000_000/intervalUs)*float64(packet.MAX_PAYLOAD_SIZE)*8/1024/1024/1000))
 			
 			// With accurate arrival timestamps, all intervals should be realistic
 			if intervalUs > 0 {
