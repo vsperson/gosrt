@@ -153,50 +153,53 @@ func (r *receiver) Flush() {
 	r.packetList = r.packetList.Init()
 }
 
-// calculateMedianCapacity returns the filtered average of probe pair samples.
-// This is the libsrt algorithm: median filter + arithmetic average of filtered values.
-// Algorithm:
-// 1. Find median of all samples
-// 2. Filter: keep only values in range [median/8, median*8]
-// 3. Calculate average of filtered values + median
-// 4. Result: 1_000_000 / average
+// calculateMedianCapacity returns the bandwidth in packets-per-second.
+// This is the libsrt algorithm:
+// 1. Samples are stored as scaled intervals in microseconds
+// 2. Find median interval
+// 3. Filter: keep only intervals in range [median/8, median*8]
+// 4. Calculate average of filtered intervals + median
+// 5. Convert to packets-per-second: 1_000_000 / average_interval
 // Must be called with lock held.
 func (r *receiver) calculateMedianCapacity() float64 {
 	if r.probeCount == 0 {
 		return 0
 	}
 
-	// Copy samples for sorting (don't modify original)
-	samples := make([]float64, r.probeCount)
-	copy(samples, r.probeSamples[:r.probeCount])
+	// Copy samples (scaled intervals) for sorting
+	intervals := make([]float64, r.probeCount)
+	copy(intervals, r.probeSamples[:r.probeCount])
 
 	// Sort to find median
-	sort.Float64s(samples)
+	sort.Float64s(intervals)
 	mid := r.probeCount / 2
-	median := samples[mid]
+	median := intervals[mid]
 
 	// Filter range: [median/8, median*8]
 	lower := median / 8.0
 	upper := median * 8.0
 
-	// Calculate average of filtered values
-	sum := median // Start with median (libsrt includes it)
+	// Calculate average of filtered intervals (libsrt includes median)
+	sum := median
 	count := 1.0
 
-	for _, sample := range samples {
-		// Keep values in filter range (excluding median itself as we already added it)
-		if sample > lower && sample < upper && sample != median {
-			sum += sample
+	for _, interval := range intervals {
+		// Keep intervals in filter range (excluding median as we already added it)
+		if interval > lower && interval < upper && interval != median {
+			sum += interval
 			count++
 		}
 	}
 
 	if count == 0 {
-		return median
+		return 0
 	}
 
-	// Return average of filtered values
-	return sum / count
+	// Average interval in microseconds
+	avgInterval := sum / count
+
+	// Convert to packets per second: 1_000_000 / interval_us
+	return 1_000_000 / avgInterval
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
@@ -209,9 +212,9 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 	// Probe pair bandwidth estimation (libsrt algorithm).
 	// Every 16th and 17th packet are sent back-to-back as probe pairs.
-	// The receiver measures inter-arrival time and uses MEDIAN FILTER to discard outliers.
-	// Formula: capacity_pps = 1_000_000 / interval_us (packets per second)
-	// See: https://srtlab.github.io/srt-cookbook/protocol/bandwidth-estimation.html
+	// The receiver measures inter-arrival time, scales it by packet size, and filters outliers.
+	// libsrt stores: (interval_us * MAX_PAYLOAD_SIZE) / actual_packet_size
+	// This normalizes intervals to full-size packets.
 	if !pkt.Header().RetransmittedPacketFlag {
 		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
 		if probe == 0 {
@@ -221,17 +224,18 @@ func (r *receiver) Push(pkt packet.Packet) {
 			// Measure inter-arrival time in microseconds
 			intervalUs := float64(time.Since(r.probeTime).Microseconds())
 			if intervalUs > 0 {
-				// Calculate capacity: packets per second
-				sample := 1_000_000 / intervalUs
+				// Scale interval by packet size (libsrt algorithm)
+				// stored_interval = interval * MAX_PAYLOAD_SIZE / actual_packet_size
+				scaledInterval := intervalUs * float64(packet.MAX_PAYLOAD_SIZE) / float64(pkt.Len())
 
-				// Add sample to circular buffer
-				r.probeSamples[r.probeIndex] = sample
+				// Store scaled interval (NOT packets-per-second)
+				r.probeSamples[r.probeIndex] = scaledInterval
 				r.probeIndex = (r.probeIndex + 1) % probeWindowSize
 				if r.probeCount < probeWindowSize {
 					r.probeCount++
 				}
 
-				// Calculate median of collected samples (libsrt algorithm)
+				// Calculate bandwidth from filtered average of intervals
 				r.linkCapacity = r.calculateMedianCapacity()
 			}
 			r.probeTime = time.Time{}
