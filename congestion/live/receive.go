@@ -3,6 +3,7 @@ package live
 import (
 	"container/list"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +12,10 @@ import (
 	"github.com/datarhei/gosrt/congestion"
 	"github.com/datarhei/gosrt/packet"
 )
+
+// probeWindowSize is the number of probe pair samples to keep for median filter.
+// libsrt uses median filter to discard outliers from bandwidth estimation.
+const probeWindowSize = 16
 
 // ReceiveConfig is the configuration for the liveRecv congestion control
 type ReceiveConfig struct {
@@ -38,11 +43,15 @@ type receiver struct {
 	lastPeriodicACK uint64
 	lastPeriodicNAK uint64
 
-	avgPayloadSize  float64 // bytes
-	avgLinkCapacity float64 // packets per second
+	avgPayloadSize float64 // bytes
 
-	probeTime    time.Time
-	probeNextSeq circular.Number
+	// Probe pair bandwidth estimation (libsrt algorithm)
+	probeTime     time.Time
+	probeNextSeq  circular.Number
+	probeSamples  []float64 // circular buffer of capacity samples (pps)
+	probeIndex    int       // current index in circular buffer
+	probeCount    int       // number of samples collected
+	linkCapacity  float64   // median-filtered link capacity (pps)
 
 	statistics congestion.ReceiveStats
 
@@ -78,6 +87,9 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
 
+		// Probe pair samples buffer for median filter (libsrt algorithm)
+		probeSamples: make([]float64, probeWindowSize),
+
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
@@ -108,8 +120,8 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 	r.statistics.BytePayload = uint64(r.avgPayloadSize)
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
 
-	// Link capacity from probe pairs measurement
-	linkCapacity := r.avgLinkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
+	// Link capacity from probe pairs with median filter (libsrt algorithm)
+	linkCapacity := r.linkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
 
 	// Fallback: if probe pairs didn't work (losses, jitter), use receive bandwidth
 	// as a lower bound estimate. The actual link capacity is at least what we're receiving.
@@ -129,7 +141,7 @@ func (r *receiver) PacketRate() (pps, bps, capacity float64) {
 
 	pps = r.rate.packetsPerSecond
 	bps = r.rate.bytesPerSecond
-	capacity = r.avgLinkCapacity
+	capacity = r.linkCapacity
 
 	return
 }
@@ -141,6 +153,28 @@ func (r *receiver) Flush() {
 	r.packetList = r.packetList.Init()
 }
 
+// calculateMedianCapacity returns the median of probe pair samples.
+// This is the libsrt algorithm for filtering outliers from bandwidth estimation.
+// Must be called with lock held.
+func (r *receiver) calculateMedianCapacity() float64 {
+	if r.probeCount == 0 {
+		return 0
+	}
+
+	// Copy samples for sorting (don't modify original)
+	samples := make([]float64, r.probeCount)
+	copy(samples, r.probeSamples[:r.probeCount])
+
+	// Sort and return median
+	sort.Float64s(samples)
+
+	mid := r.probeCount / 2
+	if r.probeCount%2 == 0 {
+		return (samples[mid-1] + samples[mid]) / 2
+	}
+	return samples[mid]
+}
+
 func (r *receiver) Push(pkt packet.Packet) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
@@ -149,24 +183,33 @@ func (r *receiver) Push(pkt packet.Packet) {
 		return
 	}
 
-	// This is not really well (not at all) described in the specs. See core.cpp and window.h
-	// and search for PUMASK_SEQNO_PROBE (0xF). Every 16th and 17th packet are
-	// sent in pairs. This is used as a probe for the theoretical capacity of the link.
+	// Probe pair bandwidth estimation (libsrt algorithm).
+	// Every 16th and 17th packet are sent back-to-back as probe pairs.
+	// The receiver measures inter-arrival time and uses MEDIAN FILTER to discard outliers.
+	// See: https://srtlab.github.io/srt-cookbook/protocol/bandwidth-estimation.html
 	if !pkt.Header().RetransmittedPacketFlag {
 		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
 		if probe == 0 {
 			r.probeTime = time.Now()
 			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
 		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
-			// The time between packets scaled to a fully loaded packet
+			// Measure inter-arrival time scaled to full packet size
 			diff := float64(time.Since(r.probeTime).Microseconds()) * (packet.MAX_PAYLOAD_SIZE / float64(pkt.Len()))
-			// Minimum diff of 10 microseconds prevents unrealistic capacity estimates
-			// when packets arrive in bursts. 10us = max ~100k pps = ~1.1 Gbps theoretical max.
-			if diff < 10 {
-				diff = 10
+			if diff > 0 {
+				// Calculate capacity sample: packets per second
+				sample := 1_000_000 / diff
+
+				// Add sample to circular buffer
+				r.probeSamples[r.probeIndex] = sample
+				r.probeIndex = (r.probeIndex + 1) % probeWindowSize
+				if r.probeCount < probeWindowSize {
+					r.probeCount++
+				}
+
+				// Calculate median of collected samples (libsrt algorithm)
+				r.linkCapacity = r.calculateMedianCapacity()
 			}
-			// Here we're doing an average of the measurements.
-			r.avgLinkCapacity = 0.875*r.avgLinkCapacity + 0.125*1_000_000/diff
+			r.probeTime = time.Time{}
 		} else {
 			r.probeTime = time.Time{}
 		}
