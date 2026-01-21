@@ -39,6 +39,7 @@ type receiver struct {
 	lastPeriodicNAK uint64
 
 	avgPayloadSize float64 // bytes
+	maxLinkCapacity float64 // Mbps, tracks maximum observed receive bandwidth
 
 	statistics congestion.ReceiveStats
 
@@ -105,14 +106,18 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
 
 	// Link capacity from probe pairs with median filter (libsrt algorithm)
-	// Link capacity estimation: use receive bandwidth
+	// Link capacity estimation: use maximum observed receive bandwidth
 	// NOTE: Probe pair method doesn't work reliably in Go because packets are read
 	// in batches from socket buffer, giving all packets nearly identical timestamps.
 	// This requires kernel-level SO_TIMESTAMPNS support which is complex to implement.
 	// libsrt falls back to receive bandwidth in such cases.
-	linkCapacity := r.statistics.MbpsEstimatedRecvBandwidth
-
-	r.statistics.MbpsEstimatedLinkCapacity = linkCapacity
+	//
+	// Track maximum bandwidth to represent channel capacity (not current utilization)
+	if r.statistics.MbpsEstimatedRecvBandwidth > r.maxLinkCapacity {
+		r.maxLinkCapacity = r.statistics.MbpsEstimatedRecvBandwidth
+	}
+	
+	r.statistics.MbpsEstimatedLinkCapacity = r.maxLinkCapacity
 	r.statistics.PktLossRate = r.rate.pktLossRate
 
 	return r.statistics
@@ -124,8 +129,8 @@ func (r *receiver) PacketRate() (pps, bps, capacity float64) {
 
 	pps = r.rate.packetsPerSecond
 	bps = r.rate.bytesPerSecond
-	// capacity is now based on receive bandwidth, not probe pairs
-	capacity = r.statistics.MbpsEstimatedRecvBandwidth
+	// capacity is maximum observed bandwidth (represents channel capacity)
+	capacity = r.maxLinkCapacity
 
 	return
 }
