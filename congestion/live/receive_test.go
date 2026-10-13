@@ -781,3 +781,142 @@ func TestRecvLinkCapacityUnits(t *testing.T) {
 	stats := recv.Stats()
 	require.InDelta(t, 10, stats.MbpsEstimatedLinkCapacity, 0.001)
 }
+
+func TestRecvLossSingleGap(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for _, i := range []uint32{0, 1, 2, 4} {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	require.Equal(t, uint64(1), recv.statistics.PktLoss)
+	require.Equal(t, uint64(0), recv.statistics.PktDrop)
+}
+
+func TestRecvDropNotRecovered(t *testing.T) {
+	numbers := []uint32{}
+	recv := mockLiveRecv(
+		nil,
+		nil,
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	// 3, 4 and 5 are missing and never arrive
+	for _, i := range []uint32{0, 1, 2, 6, 7} {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	require.Equal(t, uint64(3), recv.statistics.PktLoss)
+
+	recv.Tick(10)
+
+	require.Equal(t, []uint32{0, 1, 2, 6, 7}, numbers)
+	require.Equal(t, uint64(3), recv.statistics.PktLoss)
+	require.Equal(t, uint64(3), recv.statistics.PktLost)
+	require.Equal(t, uint64(3), recv.statistics.PktDrop)
+	require.Equal(t, 3*uint64(recv.avgPayloadSize), recv.statistics.ByteDrop)
+
+	// A retransmission of a dropped packet is belated and not counted as dropped again
+	p := packet.NewPacket(addr)
+	p.Header().PacketSequenceNumber = circular.New(4, packet.MAX_SEQUENCENUMBER)
+	p.Header().PktTsbpdTime = 5
+	p.Header().RetransmittedPacketFlag = true
+
+	recv.Push(p)
+
+	require.Equal(t, uint64(1), recv.statistics.PktBelated)
+	require.Equal(t, uint64(3), recv.statistics.PktDrop)
+}
+
+func TestRecvDropRecovered(t *testing.T) {
+	numbers := []uint32{}
+	recv := mockLiveRecv(
+		nil,
+		nil,
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for _, i := range []uint32{0, 1, 2, 6, 7} {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	// The missing packets are retransmitted in time
+	for _, i := range []uint32{3, 4, 5} {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+		p.Header().RetransmittedPacketFlag = true
+
+		recv.Push(p)
+	}
+
+	recv.Tick(10)
+
+	require.Equal(t, []uint32{0, 1, 2, 3, 4, 5, 6, 7}, numbers)
+	require.Equal(t, uint64(3), recv.statistics.PktLoss)
+	require.Equal(t, uint64(3), recv.statistics.PktRetrans)
+	require.Equal(t, uint64(0), recv.statistics.PktLost)
+	require.Equal(t, uint64(0), recv.statistics.PktDrop)
+}
+
+func TestRecvReorderTolerance(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		ReorderTolerance:      2,
+		OnSendNAK: func(list []circular.Number) {
+			l := []uint32{}
+			for _, n := range list {
+				l = append(l, n.Val())
+			}
+			nakList = append(nakList, l)
+		},
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	// 2 missing packets are within the tolerance: counted as loss, but no immediate NAK
+	push(0)
+	push(3)
+
+	require.Equal(t, uint64(2), recv.statistics.PktLoss)
+	require.Equal(t, 0, len(nakList))
+
+	// 3 missing packets exceed the tolerance: immediate NAK
+	push(7)
+
+	require.Equal(t, uint64(5), recv.statistics.PktLoss)
+	require.Equal(t, [][]uint32{{4, 6}}, nakList)
+}

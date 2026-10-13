@@ -119,8 +119,9 @@ type ReceiveStats struct {
 	PktLate  uint64
 	ByteLate uint64
 
-	// The total number of dropped DATA packets and, as a result, not delivered to the upstream application. This includes packets
-	// that arrived too late, already received, or already ACKed.
+	// The total number of dropped DATA packets and, as a result, not delivered to the upstream application. As in libsrt, these
+	// are the missing packets skipped by the too-late packet drop (TLPKTDROP). Packets that arrived too late (see PktBelated)
+	// or more than once are not counted.
 	PktDrop  uint64
 	ByteDrop uint64
 
