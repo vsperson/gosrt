@@ -185,6 +185,31 @@ known options (similar to [srt-live-transmit](https://github.com/Haivision/srt/b
 | `tlpktdrop`          | `bool`                 | Drop too late packets.                                                  |
 | `transtype`          | `live`                 | Transmission type. Must be `live`.                                      |
 | `tsbpdmode`          | `bool`                 | Enable timestamp-based packet delivery mode.                            |
+| `readqueuesize`      | `packets`              | Size of the read queue buffer. Default: 1024. Recommended: 8192-16384 for high-bitrate streams. |
+| `networkqueuesize`   | `packets`              | Size of the network queue buffer. Default: 1024. Recommended: 2048-4096. |
+| `writequeuesize`     | `packets`              | Size of the write queue buffer. Default: 1024.                          |
+| `blockonfullqueue`   | `bool`                 | Block when queues are full instead of dropping packets. Default: false. |
+
+### Preventing Packet Drops
+
+For high-bitrate streams or systems under load, you may experience packet drops due to internal queue overflow. The new queue configuration options help address this:
+
+**Increase queue sizes** for high-bitrate streams:
+```shell
+srt://127.0.0.1:6001/?readqueuesize=8192&networkqueuesize=2048
+```
+
+**Enable blocking mode** to prevent drops at the cost of potential latency increase:
+```shell
+srt://127.0.0.1:6001/?blockonfullqueue=true
+```
+
+**Combined approach** for production high-bitrate scenarios:
+```shell
+srt://127.0.0.1:6001/?readqueuesize=16384&networkqueuesize=4096&blockonfullqueue=true
+```
+
+The `PktQueueDrop` and `ByteQueueDrop` statistics will show if you're experiencing queue-related drops.
 
 ### Usage
 
