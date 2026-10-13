@@ -39,10 +39,13 @@ type receiver struct {
 	lastPeriodicNAK uint64
 
 	avgPayloadSize  float64 // bytes
-	avgLinkCapacity float64 // packets per second
+	maxLinkCapacity float64 // Mbps, tracks maximum observed receive bandwidth
 
-	probeTime    time.Time
-	probeNextSeq circular.Number
+	// Link Capacity Probing
+	lastProbeTime  time.Time
+	lastProbeSeq   circular.Number
+	probeSamples   []float64
+	probeSampleIdx int
 
 	statistics congestion.ReceiveStats
 
@@ -81,6 +84,8 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
+
+		probeSamples: make([]float64, 16), // Store last 16 samples for median filtering
 	}
 
 	if r.sendACK == nil {
@@ -107,19 +112,70 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 
 	r.statistics.BytePayload = uint64(r.avgPayloadSize)
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
-	r.statistics.MbpsEstimatedLinkCapacity = r.avgLinkCapacity * packet.MAX_PAYLOAD_SIZE * 8 / 1024 / 1024
+	r.updateLinkCapacity()
+
+	r.statistics.MbpsEstimatedLinkCapacity = r.maxLinkCapacity
 	r.statistics.PktLossRate = r.rate.pktLossRate
 
 	return r.statistics
+}
+
+// updateLinkCapacity updates the estimated link capacity in Mbps. The caller must hold the lock.
+func (r *receiver) updateLinkCapacity() {
+	mbpsRecvBandwidth := r.rate.bytesPerSecond * 8 / 1024 / 1024
+
+	// Link capacity from probe pairs with median filter (libsrt algorithm)
+	// We use the probeSamples collected in Push() to estimate capacity.
+	// If no samples (e.g. buffered socket), fallback to max observed bandwidth.
+
+	// Calculate median of probe samples
+	var medianCapacity float64
+	if len(r.probeSamples) > 0 && r.probeSamples[0] > 0 {
+		// Copy samples to avoid sorting the ring buffer
+		sorted := make([]float64, len(r.probeSamples))
+		copy(sorted, r.probeSamples)
+		// Simple bubble sort for small array
+		for i := 0; i < len(sorted); i++ {
+			for j := i + 1; j < len(sorted); j++ {
+				if sorted[i] > sorted[j] {
+					sorted[i], sorted[j] = sorted[j], sorted[i]
+				}
+			}
+		}
+		// Count non-zero samples
+		count := 0
+		for _, v := range sorted {
+			if v > 0 {
+				count++
+			}
+		}
+
+		if count > 0 {
+			// Get median of non-zero samples
+			// The zeros are at the beginning because we sorted ascending
+			startIdx := len(sorted) - count
+			medianCapacity = sorted[startIdx+count/2]
+		}
+	}
+
+	// If probe estimation works, use it. Otherwise fallback to max bandwidth.
+	if medianCapacity > mbpsRecvBandwidth {
+		r.maxLinkCapacity = medianCapacity
+	} else if mbpsRecvBandwidth > r.maxLinkCapacity {
+		r.maxLinkCapacity = mbpsRecvBandwidth
+	}
 }
 
 func (r *receiver) PacketRate() (pps, bps, capacity float64) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
+	r.updateLinkCapacity()
+
 	pps = r.rate.packetsPerSecond
 	bps = r.rate.bytesPerSecond
-	capacity = r.avgLinkCapacity
+	// The link capacity is reported in packets per second (full sized packets)
+	capacity = r.maxLinkCapacity * 1024 * 1024 / 8 / packet.MAX_PAYLOAD_SIZE
 
 	return
 }
@@ -137,28 +193,6 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 	if pkt == nil {
 		return
-	}
-
-	// This is not really well (not at all) described in the specs. See core.cpp and window.h
-	// and search for PUMASK_SEQNO_PROBE (0xF). Every 16th and 17th packet are
-	// sent in pairs. This is used as a probe for the theoretical capacity of the link.
-	if !pkt.Header().RetransmittedPacketFlag {
-		probe := pkt.Header().PacketSequenceNumber.Val() & 0xF
-		if probe == 0 {
-			r.probeTime = time.Now()
-			r.probeNextSeq = pkt.Header().PacketSequenceNumber.Inc()
-		} else if probe == 1 && pkt.Header().PacketSequenceNumber.Equals(r.probeNextSeq) && !r.probeTime.IsZero() && pkt.Len() != 0 {
-			// The time between packets scaled to a fully loaded packet
-			diff := float64(time.Since(r.probeTime).Microseconds()) * (packet.MAX_PAYLOAD_SIZE / float64(pkt.Len()))
-			if diff != 0 {
-				// Here we're doing an average of the measurements.
-				r.avgLinkCapacity = 0.875*r.avgLinkCapacity + 0.125*1_000_000/diff
-			}
-		} else {
-			r.probeTime = time.Time{}
-		}
-	} else {
-		r.probeTime = time.Time{}
 	}
 
 	r.nPackets++
@@ -253,6 +287,41 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 	r.statistics.ByteBuf += pktLen
 	r.statistics.ByteUnique += pktLen
+
+	// Probe Packet Logic for Link Capacity Estimation
+	// Probe packets are sent every 16 packets. Pairs are (0, 1), (16, 17), etc.
+	// We measure the time difference between the arrival of the pair.
+	seqVal := pkt.Header().PacketSequenceNumber.Val()
+	probeSeq := seqVal & 0xF
+
+	if probeSeq == 0 {
+		r.lastProbeTime = time.Now()
+		r.lastProbeSeq = pkt.Header().PacketSequenceNumber
+	} else if probeSeq == 1 {
+		// Check if this is the pair of the last probe
+		if pkt.Header().PacketSequenceNumber.Equals(r.lastProbeSeq.Inc()) {
+			now := time.Now()
+			delta := now.Sub(r.lastProbeTime)
+
+			// Filter out buffered packets (delta too small)
+			// 10us is arbitrary but filters out "instant" reads from buffer
+			// At 10Gbps, 1500 bytes take ~1.2us. At 1Gbps ~12us.
+			// If we see < 1us, it's definitely buffered.
+			// Go's time resolution might be limited.
+			if delta > 1*time.Microsecond {
+				// Calculate Mbps
+				mbps := float64(pktLen*8) / delta.Seconds() / 1024 / 1024
+
+				// Sanity check: ignore unrealistic values (e.g. > 100Gbps)
+				if mbps < 100000 {
+					if len(r.probeSamples) > 0 {
+						r.probeSamples[r.probeSampleIdx] = mbps
+						r.probeSampleIdx = (r.probeSampleIdx + 1) % len(r.probeSamples)
+					}
+				}
+			}
+		}
+	}
 
 	r.packetList.PushBack(pkt)
 }
