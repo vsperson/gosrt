@@ -112,6 +112,18 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 
 	r.statistics.BytePayload = uint64(r.avgPayloadSize)
 	r.statistics.MbpsEstimatedRecvBandwidth = r.rate.bytesPerSecond * 8 / 1024 / 1024
+	r.updateLinkCapacity()
+
+	r.statistics.MbpsEstimatedLinkCapacity = r.maxLinkCapacity
+	r.statistics.PktLossRate = r.rate.pktLossRate
+
+	return r.statistics
+}
+
+// updateLinkCapacity updates the estimated link capacity in Mbps. The caller must hold the lock.
+func (r *receiver) updateLinkCapacity() {
+	mbpsRecvBandwidth := r.rate.bytesPerSecond * 8 / 1024 / 1024
+
 	// Link capacity from probe pairs with median filter (libsrt algorithm)
 	// We use the probeSamples collected in Push() to estimate capacity.
 	// If no samples (e.g. buffered socket), fallback to max observed bandwidth.
@@ -147,26 +159,23 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 	}
 
 	// If probe estimation works, use it. Otherwise fallback to max bandwidth.
-	if medianCapacity > r.statistics.MbpsEstimatedRecvBandwidth {
+	if medianCapacity > mbpsRecvBandwidth {
 		r.maxLinkCapacity = medianCapacity
-	} else if r.statistics.MbpsEstimatedRecvBandwidth > r.maxLinkCapacity {
-		r.maxLinkCapacity = r.statistics.MbpsEstimatedRecvBandwidth
+	} else if mbpsRecvBandwidth > r.maxLinkCapacity {
+		r.maxLinkCapacity = mbpsRecvBandwidth
 	}
-
-	r.statistics.MbpsEstimatedLinkCapacity = r.maxLinkCapacity
-	r.statistics.PktLossRate = r.rate.pktLossRate
-
-	return r.statistics
 }
 
 func (r *receiver) PacketRate() (pps, bps, capacity float64) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
+	r.updateLinkCapacity()
+
 	pps = r.rate.packetsPerSecond
 	bps = r.rate.bytesPerSecond
-	// capacity is maximum observed bandwidth (represents channel capacity)
-	capacity = r.maxLinkCapacity
+	// The link capacity is reported in packets per second (full sized packets)
+	capacity = r.maxLinkCapacity * 1024 * 1024 / 8 / packet.MAX_PAYLOAD_SIZE
 
 	return
 }
@@ -301,7 +310,7 @@ func (r *receiver) Push(pkt packet.Packet) {
 			// Go's time resolution might be limited.
 			if delta > 1*time.Microsecond {
 				// Calculate Mbps
-				mbps := float64(pktLen*8) / delta.Seconds() / 1e6
+				mbps := float64(pktLen*8) / delta.Seconds() / 1024 / 1024
 
 				// Sanity check: ignore unrealistic values (e.g. > 100Gbps)
 				if mbps < 100000 {

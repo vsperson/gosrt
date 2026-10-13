@@ -762,3 +762,18 @@ func TestRecvLost(t *testing.T) {
 	require.Equal(t, uint64(3), recv.statistics.PktLoss)
 	require.Equal(t, uint64(3), recv.statistics.PktLost)
 }
+
+func TestRecvLinkCapacityUnits(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	// Probe samples are in Mbps. The median of 9, 10, 10, 11 is 10.
+	copy(recv.probeSamples, []float64{9, 10, 10, 11})
+
+	_, _, capacity := recv.PacketRate()
+
+	// PacketRate reports the link capacity in full sized packets per second, as it is sent in the ACK
+	require.InDelta(t, 10.0*1024*1024/8/packet.MAX_PAYLOAD_SIZE, capacity, 0.001)
+
+	stats := recv.Stats()
+	require.InDelta(t, 10, stats.MbpsEstimatedLinkCapacity, 0.001)
+}
