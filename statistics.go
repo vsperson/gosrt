@@ -42,6 +42,7 @@ type StatisticsAccumulated struct {
 	PktSendDrop      uint64 // The total number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
 	PktRecvDrop      uint64 // The total number of dropped by the SRT receiver and, as a result, not delivered to the upstream application DATA packets
 	PktRecvUndecrypt uint64 // The total number of packets that failed to be decrypted at the receiver side
+	PktQueueDrop     uint64 // The total number of packets dropped due to full internal queues
 
 	ByteSent          uint64 // Same as pktSent, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecv          uint64 // Same as pktRecv, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
@@ -55,6 +56,7 @@ type StatisticsAccumulated struct {
 	ByteSendDrop      uint64 // Same as pktSendDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvDrop      uint64 // Same as pktRecvDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvUndecrypt uint64 // Same as pktRecvUndecrypt, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
+	ByteQueueDrop     uint64 // Same as pktQueueDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 }
 
 type StatisticsInterval struct {
@@ -165,6 +167,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		PktSendDrop:       send.PktDrop,
 		PktRecvDrop:       recv.PktDrop,
 		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
+		PktQueueDrop:      c.statistics.pktQueueDrop,
 		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
 		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
 		ByteSentUnique:    send.ByteUnique + (send.PktUnique * c.statistics.headerSize),
@@ -177,6 +180,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),
 		ByteRecvDrop:      recv.ByteDrop + (recv.PktDrop * c.statistics.headerSize),
 		ByteRecvUndecrypt: c.statistics.byteRecvUndecrypt + (c.statistics.pktRecvUndecrypt * c.statistics.headerSize),
+		ByteQueueDrop:     c.statistics.byteQueueDrop + (c.statistics.pktQueueDrop * c.statistics.headerSize),
 	}
 
 	// Interval
