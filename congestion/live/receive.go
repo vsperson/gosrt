@@ -253,18 +253,13 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 	//  5.1.2. SRT's Default LiveCC Algorithm
 	r.avgPayloadSize = 0.875*r.avgPayloadSize + 0.125*float64(pktLen)
 
-	if pkt.Header().PacketSequenceNumber.Lte(r.lastDeliveredSequenceNumber) {
-		// Too old, because up until r.lastDeliveredSequenceNumber, we already delivered
+	if pkt.Header().PacketSequenceNumber.Lte(r.lastDeliveredSequenceNumber) || pkt.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) {
+		// Too old, because up until r.lastDeliveredSequenceNumber we already delivered, or up until
+		// r.lastACKSequenceNumber we already acknowledged. E.g. a retransmission of a packet that arrived
+		// meanwhile out of order. As libsrt, it is counted as belated, but not as a drop.
 		r.statistics.PktBelated++
 		r.statistics.ByteBelated += pktLen
 
-		// Note: libsrt does NOT count this as PktDrop - packet is just ignored
-		return
-	}
-
-	if pkt.Header().PacketSequenceNumber.Lt(r.lastACKSequenceNumber) {
-		// Already acknowledged, ignoring
-		// Note: libsrt does NOT count this as PktDrop - packet is just ignored
 		return
 	}
 

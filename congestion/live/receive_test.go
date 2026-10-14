@@ -403,8 +403,9 @@ func TestRecvDropAlreadyACK(t *testing.T) {
 
 	stats = recv.Stats()
 
-	// Note: libsrt doesn't count already ACK'd packets as PktDrop - they are just ignored
+	// As libsrt, already ACK'd packets are counted as belated, not as dropped
 	require.Equal(t, uint64(0), stats.PktDrop)
+	require.Equal(t, uint64(1), stats.PktBelated)
 }
 
 func TestRecvDropAlreadyRecvNoACK(t *testing.T) {
@@ -1121,4 +1122,41 @@ func TestRecvBacklogWithGap(t *testing.T) {
 
 	require.Equal(t, []uint32{4, 5}, numbers)
 	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+}
+
+func TestRecvBelatedRetransmission(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, retransmitted bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 100)
+		p.Header().RetransmittedPacketFlag = retransmitted
+
+		recv.Push(p)
+	}
+
+	// 2 is missing and arrives out of order, filling the gap
+	push(0, false)
+	push(1, false)
+	push(3, false)
+	push(4, false)
+	push(2, false)
+
+	// The ACK moves past 2
+	recv.Tick(10)
+	require.Equal(t, uint32(4), recv.lastACKSequenceNumber.Val())
+
+	// The retransmission of 2, requested by the NAK, arrives
+	push(2, true)
+
+	// The retransmission of the last ACK'd packet arrives
+	push(4, true)
+
+	require.Equal(t, uint64(1), recv.statistics.PktLoss)
+	require.Equal(t, uint64(2), recv.statistics.PktBelated)
+	require.Equal(t, uint64(0), recv.statistics.PktDrop)
+	require.Equal(t, uint64(5), recv.statistics.PktBuf)
 }
