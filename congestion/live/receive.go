@@ -272,8 +272,8 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 			p := e.Value.(packet.Packet)
 
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
-				// Already received (has been sent more than once), ignoring
-				// Note: libsrt does NOT count duplicates as PktDrop
+				// Already received, this is a redundant copy. As libsrt, it is ignored without counting
+				// it, neither as belated nor as dropped.
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
 				// Late arrival, this fills a gap
