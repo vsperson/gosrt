@@ -905,3 +905,112 @@ func TestRecvReorderTolerance(t *testing.T) {
 	require.Equal(t, uint64(5), recv.statistics.PktLoss)
 	require.Equal(t, [][]uint32{{4, 6}}, nakList)
 }
+
+func TestRecvPushDropped(t *testing.T) {
+	numbers := []uint32{}
+	nakList := [][]uint32{}
+	recv := mockLiveRecv(
+		nil,
+		func(list []circular.Number) {
+			l := []uint32{}
+			for _, n := range list {
+				l = append(l, n.Val())
+			}
+			nakList = append(nakList, l)
+		},
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for i := uint32(0); i < 5; i++ {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		if i == 2 {
+			recv.PushDropped(p)
+		} else {
+			recv.Push(p)
+		}
+	}
+
+	require.Equal(t, uint64(5), recv.statistics.Pkt)
+	require.Equal(t, uint64(4), recv.statistics.PktBuf)
+	require.Equal(t, uint64(4), recv.statistics.PktUnique)
+	require.Equal(t, uint64(1), recv.statistics.PktDrop)
+	require.Equal(t, uint64(0), recv.statistics.PktLoss)
+
+	recv.Tick(10)
+
+	require.Equal(t, []uint32{0, 1, 3, 4}, numbers)
+	require.Equal(t, 0, len(nakList))
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+	require.Equal(t, uint64(1), recv.statistics.PktDrop)
+	require.Equal(t, uint64(0), recv.statistics.PktLost)
+	require.Equal(t, 0, len(recv.dropped))
+}
+
+func TestRecvPushDroppedFillsGap(t *testing.T) {
+	numbers := []uint32{}
+	nakList := [][]uint32{}
+	recv := mockLiveRecv(
+		nil,
+		func(list []circular.Number) {
+			l := []uint32{}
+			for _, n := range list {
+				l = append(l, n.Val())
+			}
+			nakList = append(nakList, l)
+		},
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, dropped bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 100)
+
+		if dropped {
+			recv.PushDropped(p)
+		} else {
+			recv.Push(p)
+		}
+	}
+
+	push(0, false)
+	push(2, false)
+
+	require.Equal(t, [][]uint32{{1, 1}}, nakList)
+	require.Equal(t, uint64(1), recv.statistics.PktLoss)
+
+	// The periodic NAK reports the missing packet
+	nakList = nakList[:0]
+	recv.Tick(30)
+	require.Equal(t, [][]uint32{{1, 1}}, nakList)
+
+	// The missing packet arrives as a retransmission, but it can't be decrypted
+	push(1, true)
+
+	// The periodic NAK doesn't report it anymore
+	nakList = nakList[:0]
+	recv.Tick(60)
+	require.Equal(t, 0, len(nakList))
+
+	// A retransmission of the dropped packet is ignored
+	push(1, false)
+
+	recv.Tick(200)
+
+	require.Equal(t, []uint32{0, 2}, numbers)
+	require.Equal(t, uint64(1), recv.statistics.PktLoss)
+	require.Equal(t, uint64(1), recv.statistics.PktDrop)
+	require.Equal(t, uint64(0), recv.statistics.PktLost)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+}
