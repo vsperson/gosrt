@@ -243,7 +243,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteRecvBuf:           recv.ByteBuf,
 		MsRecvBuf:             recv.MsBuf,
 		MsRecvTsbPdDelay:      c.tsbpdDelay / 1000,
-		PktReorderTolerance:   uint64(c.config.LossMaxTTL),
+		PktReorderTolerance:   recv.PktReorderTolerance,
 		PktRecvAvgBelatedTime: 0,
 		PktSendLossRate:       send.PktLossRate,
 		PktRecvLossRate:       recv.PktLossRate,

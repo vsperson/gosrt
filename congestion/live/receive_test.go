@@ -883,21 +883,140 @@ func TestRecvDropRecovered(t *testing.T) {
 	require.Equal(t, uint64(0), recv.statistics.PktDrop)
 }
 
-func TestRecvReorderTolerance(t *testing.T) {
-	nakList := [][]uint32{}
-	recv := NewReceiver(ReceiveConfig{
+func mockReorderRecv(maxTolerance uint32, nakList *[][]uint32) *receiver {
+	return NewReceiver(ReceiveConfig{
 		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
 		PeriodicACKInterval:   10,
 		PeriodicNAKInterval:   20,
-		ReorderTolerance:      2,
+		ReorderTolerance:      maxTolerance,
 		OnSendNAK: func(list []circular.Number) {
 			l := []uint32{}
 			for _, n := range list {
 				l = append(l, n.Val())
 			}
-			nakList = append(nakList, l)
+			*nakList = append(*nakList, l)
 		},
 	}).(*receiver)
+}
+
+func pushSeq(recv *receiver, i uint32, retransmitted bool) {
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	p := packet.NewPacket(addr)
+	p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+	p.Header().PktTsbpdTime = uint64(i + 1_000_000)
+	p.Header().RetransmittedPacketFlag = retransmitted
+
+	recv.Push(p)
+}
+
+func TestRecvReorderTolerance(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
+
+	require.Equal(t, uint64(30), recv.Stats().PktReorderTolerance)
+
+	// 5 arrives 10 packets late
+	for i := uint32(0); i <= 15; i++ {
+		if i == 5 {
+			continue
+		}
+		pushSeq(recv, i, false)
+	}
+	pushSeq(recv, 5, false)
+
+	// The gap is counted as loss right away, but no NAK is sent
+	require.Equal(t, 0, len(nakList))
+	require.Equal(t, uint64(1), recv.statistics.PktLoss)
+	require.Equal(t, uint64(1), recv.statistics.PktLate)
+	require.Equal(t, uint64(10), recv.statistics.PktReorderDistance)
+	require.Equal(t, 0, len(recv.freshLoss))
+
+	// The periodic NAK doesn't find a gap either
+	recv.Tick(100)
+	require.Equal(t, 0, len(nakList))
+}
+
+func TestRecvReorderToleranceExpired(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
+
+	// 20 is missing, it is reported after 30 more packets arrived
+	for i := uint32(0); i <= 50; i++ {
+		if i == 20 {
+			continue
+		}
+		pushSeq(recv, i, false)
+	}
+
+	require.Equal(t, 0, len(nakList))
+
+	pushSeq(recv, 51, false)
+
+	require.Equal(t, [][]uint32{{20, 20}}, nakList)
+	require.Equal(t, 0, len(recv.freshLoss))
+
+	// It is reported only once
+	pushSeq(recv, 52, false)
+	require.Equal(t, 1, len(nakList))
+}
+
+func TestRecvReorderToleranceAdapts(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
+
+	// The tolerance decreases by one after 50 packets in order
+	seq := uint32(0)
+	for ; seq < 500; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	require.Equal(t, uint64(20), recv.Stats().PktReorderTolerance)
+
+	reorder := func(distance uint32) {
+		// The packet at seq is missing and arrives after distance more packets
+		missing := seq
+		for i := uint32(1); i <= distance; i++ {
+			pushSeq(recv, missing+i, false)
+		}
+		pushSeq(recv, missing, false)
+		seq += distance + 1
+	}
+
+	// A reordered original increases the tolerance
+	reorder(25)
+	require.Equal(t, uint64(25), recv.Stats().PktReorderTolerance)
+
+	// But not beyond the max.
+	reorder(40)
+	require.Equal(t, uint64(30), recv.Stats().PktReorderTolerance)
+	require.Equal(t, uint64(40), recv.Stats().PktReorderDistance)
+
+	// A retransmission doesn't increase the tolerance
+	for ; seq < 1000; seq++ {
+		pushSeq(recv, seq, false)
+	}
+	tolerance := recv.Stats().PktReorderTolerance
+	pushSeq(recv, seq+5, false)
+	pushSeq(recv, seq+4, true)
+	require.Equal(t, tolerance, recv.Stats().PktReorderTolerance)
+	seq += 6
+
+	// 10 reordered packets in a row that arrived early decrease the tolerance by one
+	tolerance = recv.Stats().PktReorderTolerance
+	for range 10 {
+		reorder(1)
+	}
+	require.Equal(t, tolerance-1, recv.Stats().PktReorderTolerance)
+
+	// Only the packets that arrived later than the tolerance at that time allowed have been
+	// reported with a NAK, 500 (25 late, tolerance 20) and 526 (40 late, tolerance 25).
+	require.Equal(t, [][]uint32{{500, 500}, {526, 526}}, nakList)
+}
+
+func TestRecvReorderToleranceTLPKTDROP(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
 
 	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
 
@@ -909,18 +1028,24 @@ func TestRecvReorderTolerance(t *testing.T) {
 		recv.Push(p)
 	}
 
-	// 2 missing packets are within the tolerance: counted as loss, but no immediate NAK
+	// 2 is missing
 	push(0)
+	push(1)
 	push(3)
+	push(4)
 
-	require.Equal(t, uint64(2), recv.statistics.PktLoss)
-	require.Equal(t, 0, len(nakList))
+	// The delivery skips 2
+	recv.Tick(10)
+	require.Equal(t, 0, len(recv.freshLoss))
 
-	// 3 missing packets exceed the tolerance: immediate NAK
-	push(7)
-
-	require.Equal(t, uint64(5), recv.statistics.PktLoss)
-	require.Equal(t, [][]uint32{{4, 6}}, nakList)
+	// 2 is not reported later
+	nakList = nakList[:0]
+	for i := uint32(5); i < 50; i++ {
+		push(i)
+	}
+	for _, l := range nakList {
+		require.NotContains(t, l, uint32(2))
+	}
 }
 
 func TestRecvPushDropped(t *testing.T) {
@@ -1201,4 +1326,38 @@ func TestRecvReorderDistance(t *testing.T) {
 
 	// PktLate counts all packets that filled a gap, original or retransmitted
 	require.Equal(t, uint64(3), recv.statistics.PktLate)
+}
+
+func TestRecvFreshLossRanges(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
+
+	n := func(i uint32) circular.Number { return circular.New(i, packet.MAX_SEQUENCENUMBER) }
+	ranges := func() [][]uint32 {
+		l := [][]uint32{}
+		for _, f := range recv.freshLoss {
+			l = append(l, []uint32{f.from.Val(), f.to.Val(), uint32(f.ttl)})
+		}
+		return l
+	}
+
+	recv.registerLoss(n(10), n(20))
+	recv.registerLoss(n(30), n(30))
+
+	// Split
+	require.Equal(t, 30, recv.removeFreshLoss(n(15)))
+	require.Equal(t, [][]uint32{{10, 14, 30}, {16, 20, 30}, {30, 30, 30}}, ranges())
+
+	// Shrink and delete
+	recv.removeFreshLoss(n(10))
+	recv.removeFreshLoss(n(20))
+	recv.removeFreshLoss(n(30))
+	require.Equal(t, [][]uint32{{11, 14, 30}, {16, 19, 30}}, ranges())
+
+	// Not in any range
+	require.Equal(t, 0, recv.removeFreshLoss(n(15)))
+
+	// Revoke up to 17
+	recv.revokeFreshLoss(n(17))
+	require.Equal(t, [][]uint32{{18, 19, 30}}, ranges())
 }

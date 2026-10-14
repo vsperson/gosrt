@@ -143,6 +143,9 @@ type ReceiveStats struct {
 	// The max. distance in sequence numbers of an original (not retransmitted) packet that arrived out of order.
 	PktReorderDistance uint64
 
+	// The current reorder tolerance in packets. It adapts to the reordering on the link, up to LossMaxTTL.
+	PktReorderTolerance uint64
+
 	BytePayload uint64
 
 	MbpsEstimatedRecvBandwidth float64

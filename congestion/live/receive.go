@@ -44,7 +44,12 @@ type receiver struct {
 
 	periodicACKInterval uint64 // config
 	periodicNAKInterval uint64 // config
-	reorderTolerance    uint32 // config
+	maxReorderTolerance uint32 // config, packets
+
+	reorderTolerance uint32 // packets, current reorder tolerance
+	freshLoss        []freshLoss
+	consecOrdered    int
+	consecEarly      int
 
 	lastPeriodicACK uint64
 	lastPeriodicNAK uint64
@@ -92,6 +97,7 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 		periodicACKInterval: config.PeriodicACKInterval,
 		periodicNAKInterval: config.PeriodicNAKInterval,
+		maxReorderTolerance: config.ReorderTolerance,
 		reorderTolerance:    config.ReorderTolerance,
 
 		avgPayloadSize: 1456, //  5.1.2. SRT's Default LiveCC Algorithm
@@ -138,6 +144,7 @@ func (r *receiver) Stats() congestion.ReceiveStats {
 
 	r.statistics.MbpsEstimatedLinkCapacity = r.maxLinkCapacity
 	r.statistics.PktLossRate = r.rate.pktLossRate
+	r.statistics.PktReorderTolerance = uint64(r.reorderTolerance)
 
 	return r.statistics
 }
@@ -208,6 +215,7 @@ func (r *receiver) Flush() {
 
 	r.packetList = r.packetList.Init()
 	clear(r.dropped)
+	r.freshLoss = r.freshLoss[:0]
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
@@ -268,21 +276,14 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	} else if pkt.Header().PacketSequenceNumber.Lte(r.maxSeenSequenceNumber) {
 		// Out of order, is it a missing piece? put it in the correct position
-
-		// As libsrt, keep track of the max. distance of original packets that arrived out of order.
-		if !pkt.Header().RetransmittedPacketFlag {
-			distance := uint64(r.maxSeenSequenceNumber.Distance(pkt.Header().PacketSequenceNumber))
-			if distance > r.statistics.PktReorderDistance {
-				r.statistics.PktReorderDistance = distance
-			}
-		}
-
 		for e := r.packetList.Front(); e != nil; e = e.Next() {
 			p := e.Value.(packet.Packet)
 
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
 				// Already received, this is a redundant copy. As libsrt, it is ignored without counting
 				// it, neither as belated nor as dropped.
+				r.unlose(pkt, false)
+
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
 				// Late arrival, this fills a gap
@@ -300,6 +301,11 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 
 				r.packetList.InsertBefore(pkt, e)
 
+				r.unlose(pkt, true)
+
+				// A retransmitted packet counts as sent in order, an original packet has been reordered.
+				r.inserted(pkt.Header().RetransmittedPacketFlag)
+
 				break
 			}
 		}
@@ -315,14 +321,8 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 		r.statistics.PktLoss += missing
 		r.statistics.ByteLoss += missing * uint64(r.avgPayloadSize)
 
-		// Only send an immediate NAK if more packets are missing than the reorder tolerance
-		// allows. Otherwise periodicNAK will report them if they are still missing.
-		if missing > uint64(r.reorderTolerance) {
-			r.sendNAK([]circular.Number{
-				r.maxSeenSequenceNumber.Inc(),
-				pkt.Header().PacketSequenceNumber.Dec(),
-			})
-		}
+		// The NAK is sent immediately or, with a reorder tolerance, after that many more packets arrived.
+		r.registerLoss(r.maxSeenSequenceNumber.Inc(), pkt.Header().PacketSequenceNumber.Dec())
 
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	}
@@ -373,6 +373,8 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 	}
 
 	r.packetList.PushBack(pkt)
+
+	r.inserted(true)
 }
 
 // markDropped marks a packet in the queue as dropped. As libsrt, it is counted as dropped right away.
@@ -524,6 +526,7 @@ func (r *receiver) Tick(now uint64) {
 			r.statistics.ByteDrop += skipped * uint64(r.avgPayloadSize)
 
 			// Update sequence numbers to skip the gap.
+			r.revokeFreshLoss(p.Header().PacketSequenceNumber.Dec())
 			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber.Dec()
 			if r.lastACKSequenceNumber.Lt(p.Header().PacketSequenceNumber.Dec()) {
 				r.lastACKSequenceNumber = p.Header().PacketSequenceNumber.Dec()
