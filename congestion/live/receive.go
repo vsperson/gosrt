@@ -20,6 +20,14 @@ type ReceiveConfig struct {
 	OnSendACK             func(seq circular.Number, light bool)
 	OnSendNAK             func(list []circular.Number)
 	OnDeliver             func(p packet.Packet)
+
+	// CanDeliver is optional. If it returns false, the packets that are ready for delivery are
+	// kept in the receiver until the next tick, instead of passing them to OnDeliver.
+	CanDeliver func() bool
+
+	// MaxBacklog is the max. number of packets that are kept because they are ready for delivery but
+	// CanDeliver returned false. If there are more, the oldest are dropped. 0 means no limit.
+	MaxBacklog uint64
 }
 
 // receiver implements the Receiver interface
@@ -60,9 +68,11 @@ type receiver struct {
 		pktLossRate float64
 	}
 
-	sendACK func(seq circular.Number, light bool)
-	sendNAK func(list []circular.Number)
-	deliver func(p packet.Packet)
+	sendACK    func(seq circular.Number, light bool)
+	sendNAK    func(list []circular.Number)
+	deliver    func(p packet.Packet)
+	canDeliver func() bool
+	maxBacklog uint64
 }
 
 // NewReceiver takes a ReceiveConfig and returns a new Receiver
@@ -81,6 +91,9 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		sendACK: config.OnSendACK,
 		sendNAK: config.OnSendNAK,
 		deliver: config.OnDeliver,
+
+		canDeliver: config.CanDeliver,
+		maxBacklog: config.MaxBacklog,
 	}
 
 	if r.sendACK == nil {
@@ -93,6 +106,10 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 
 	if r.deliver == nil {
 		r.deliver = func(p packet.Packet) {}
+	}
+
+	if r.canDeliver == nil {
+		r.canDeliver = func() bool { return true }
 	}
 
 	r.rate.last = 0
@@ -375,10 +392,17 @@ func (r *receiver) Tick(now uint64) {
 	r.lock.Lock()
 	lastDeliveredSequenceNumber := r.lastDeliveredSequenceNumber
 	removeList := make([]*list.Element, 0, r.packetList.Len())
+	var backlog []*list.Element
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
 		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
+			if backlog != nil || !r.canDeliver() {
+				// The packet is ready, but it can't be delivered now. Keep it until the next tick.
+				backlog = append(backlog, e)
+				continue
+			}
+
 			r.statistics.PktBuf--
 			r.statistics.ByteBuf -= p.Len()
 
@@ -388,6 +412,24 @@ func (r *receiver) Tick(now uint64) {
 			removeList = append(removeList, e)
 		} else {
 			break
+		}
+	}
+
+	if r.maxBacklog != 0 && uint64(len(backlog)) > r.maxBacklog {
+		// Too many packets are waiting for delivery, drop the oldest
+		for _, e := range backlog[:uint64(len(backlog))-r.maxBacklog] {
+			p := e.Value.(packet.Packet)
+
+			r.statistics.PktBuf--
+			r.statistics.ByteBuf -= p.Len()
+
+			r.statistics.PktQueueDrop++
+			r.statistics.ByteQueueDrop += p.Len()
+
+			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
+
+			p.Decommission()
+			removeList = append(removeList, e)
 		}
 	}
 

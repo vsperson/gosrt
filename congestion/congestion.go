@@ -124,6 +124,11 @@ type ReceiveStats struct {
 	PktDrop  uint64
 	ByteDrop uint64
 
+	// The total number of packets that were ready for delivery, but have been dropped because the
+	// application didn't read them in time and the backlog was full.
+	PktQueueDrop  uint64
+	ByteQueueDrop uint64
+
 	// instantaneous
 	PktBuf  uint64
 	ByteBuf uint64

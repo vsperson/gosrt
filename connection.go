@@ -334,14 +334,27 @@ func newSRTConn(config srtConnConfig) *srtConn {
 
 	// 4.8.1.  Packet Acknowledgement (ACKs, ACKACKs) -> periodicACK = 10 milliseconds
 	// 4.8.2.  Packet Retransmission (NAKs) -> periodicNAK at least 20 milliseconds
-	c.recv = live.NewReceiver(live.ReceiveConfig{
+	recvConfig := live.ReceiveConfig{
 		InitialSequenceNumber: c.initialPacketSequenceNumber,
 		PeriodicACKInterval:   10_000,
 		PeriodicNAKInterval:   20_000,
 		OnSendACK:             c.sendACK,
 		OnSendNAK:             c.sendNAK,
 		OnDeliver:             c.deliver,
-	})
+	}
+
+	if c.config.BlockOnFullQueue {
+		// Keep the packets in the receiver while the read queue is full
+		readBacklogSize := c.config.ReadBacklogSize
+		if readBacklogSize <= 0 {
+			readBacklogSize = 8192
+		}
+
+		recvConfig.CanDeliver = c.canDeliver
+		recvConfig.MaxBacklog = uint64(readBacklogSize)
+	}
+
+	c.recv = live.NewReceiver(recvConfig)
 
 	// 4.6.  Too-Late Packet Drop -> 125% of SRT latency, at least 1 second
 	// https://github.com/Haivision/srt/blob/master/docs/API/API-socket-options.md#SRTO_SNDDROPDELAY
@@ -543,24 +556,17 @@ func (c *srtConn) Write(b []byte) (int, error) {
 
 // push puts a packet on the network queue. This is where packets go that came in from the network.
 func (c *srtConn) push(p packet.Packet) {
-	if c.config.BlockOnFullQueue {
-		// Blocking write - wait for space, prevents drops
-		select {
-		case <-c.ctx.Done():
-		case c.networkQueue <- p:
-		}
-	} else {
-		// Non-blocking write to the network queue
-		select {
-		case <-c.ctx.Done():
-		case c.networkQueue <- p:
-		default:
-			c.statisticsLock.Lock()
-			c.statistics.pktQueueDrop++
-			c.statistics.byteQueueDrop += p.Len()
-			c.statisticsLock.Unlock()
-			c.log("connection:error", func() string { return "network queue is full" })
-		}
+	// Non-blocking write to the network queue. This is called from the reader of the socket that
+	// may be shared with other connections, it must never block.
+	select {
+	case <-c.ctx.Done():
+	case c.networkQueue <- p:
+	default:
+		c.statisticsLock.Lock()
+		c.statistics.pktQueueDrop++
+		c.statistics.byteQueueDrop += p.Len()
+		c.statisticsLock.Unlock()
+		c.log("connection:error", func() string { return "network queue is full" })
 	}
 }
 
@@ -661,26 +667,24 @@ func (c *srtConn) writeQueueReader(ctx context.Context) {
 
 // deliver writes the packets to the read queue in order to be consumed by the Read function.
 func (c *srtConn) deliver(p packet.Packet) {
-	if c.config.BlockOnFullQueue {
-		// Blocking write - wait for space, prevents drops
-		select {
-		case <-c.ctx.Done():
-			return
-		case c.readQueue <- p:
-		}
-	} else {
-		// Non-blocking write to the read queue
-		select {
-		case <-c.ctx.Done():
-		case c.readQueue <- p:
-		default:
-			c.statisticsLock.Lock()
-			c.statistics.pktQueueDrop++
-			c.statistics.byteQueueDrop += p.Len()
-			c.statisticsLock.Unlock()
-			c.log("connection:error", func() string { return "readQueue was blocking, dropping packet" })
-		}
+	// Non-blocking write to the read queue. With BlockOnFullQueue the receiver only delivers
+	// if canDeliver reported that there's space in the read queue.
+	select {
+	case <-c.ctx.Done():
+	case c.readQueue <- p:
+	default:
+		c.statisticsLock.Lock()
+		c.statistics.pktQueueDrop++
+		c.statistics.byteQueueDrop += p.Len()
+		c.statisticsLock.Unlock()
+		c.log("connection:error", func() string { return "readQueue was blocking, dropping packet" })
 	}
+}
+
+// canDeliver returns whether there's space in the read queue. Only the receiver writes to the read queue,
+// so if there's space, the next deliver will not drop the packet.
+func (c *srtConn) canDeliver() bool {
+	return len(c.readQueue) < cap(c.readQueue)
 }
 
 // handlePacket checks the packet header. If it is a control packet it will forwarded to the

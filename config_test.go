@@ -71,9 +71,10 @@ func TestQueueSizeConfig(t *testing.T) {
 	require.Equal(t, 1024, config.NetworkQueueSize)
 	require.Equal(t, 1024, config.WriteQueueSize)
 	require.Equal(t, false, config.BlockOnFullQueue)
+	require.Equal(t, 8192, config.ReadBacklogSize)
 
 	// Test custom queue sizes via URL
-	url := "srt://localhost:6000?readqueuesize=8192&networkqueuesize=2048&writequeuesize=4096&blockonfullqueue=true"
+	url := "srt://localhost:6000?readqueuesize=8192&networkqueuesize=2048&writequeuesize=4096&blockonfullqueue=true&readbacklogsize=1000"
 	config = Config{}
 	_, err := config.UnmarshalURL(url)
 	require.NoError(t, err)
@@ -82,6 +83,7 @@ func TestQueueSizeConfig(t *testing.T) {
 	require.Equal(t, 2048, config.NetworkQueueSize)
 	require.Equal(t, 4096, config.WriteQueueSize)
 	require.Equal(t, true, config.BlockOnFullQueue)
+	require.Equal(t, 1000, config.ReadBacklogSize)
 
 	// Test marshaling back to URL
 	marshaledURL := config.MarshalURL("localhost:6000")
@@ -93,6 +95,7 @@ func TestQueueSizeConfig(t *testing.T) {
 	require.Equal(t, config.NetworkQueueSize, config2.NetworkQueueSize)
 	require.Equal(t, config.WriteQueueSize, config2.WriteQueueSize)
 	require.Equal(t, config.BlockOnFullQueue, config2.BlockOnFullQueue)
+	require.Equal(t, config.ReadBacklogSize, config2.ReadBacklogSize)
 }
 
 func TestQueueSizeConfigVariants(t *testing.T) {

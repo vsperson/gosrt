@@ -167,7 +167,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		PktSendDrop:       send.PktDrop,
 		PktRecvDrop:       recv.PktDrop,
 		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
-		PktQueueDrop:      c.statistics.pktQueueDrop,
+		PktQueueDrop:      c.statistics.pktQueueDrop + recv.PktQueueDrop,
 		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
 		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
 		ByteSentUnique:    send.ByteUnique + (send.PktUnique * c.statistics.headerSize),
@@ -180,7 +180,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),
 		ByteRecvDrop:      recv.ByteDrop + (recv.PktDrop * c.statistics.headerSize),
 		ByteRecvUndecrypt: c.statistics.byteRecvUndecrypt + (c.statistics.pktRecvUndecrypt * c.statistics.headerSize),
-		ByteQueueDrop:     c.statistics.byteQueueDrop + (c.statistics.pktQueueDrop * c.statistics.headerSize),
+		ByteQueueDrop:     c.statistics.byteQueueDrop + recv.ByteQueueDrop + ((c.statistics.pktQueueDrop + recv.PktQueueDrop) * c.statistics.headerSize),
 	}
 
 	// Interval
