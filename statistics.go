@@ -174,7 +174,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteRecvUnique:    recv.ByteUnique + (recv.PktUnique * c.statistics.headerSize),
 		ByteRecvLoss:      recv.ByteLoss + (recv.PktLoss * c.statistics.headerSize),
 		ByteRecvBelated:   recv.ByteBelated + (recv.PktBelated * c.statistics.headerSize),
-		ByteRecvLate:      recv.ByteLate + (recv.PktBelated * c.statistics.headerSize),
+		ByteRecvLate:      recv.ByteLate + (recv.PktLate * c.statistics.headerSize),
 		ByteRetrans:       send.ByteRetrans + (send.PktRetrans * c.statistics.headerSize),
 		ByteRecvRetrans:   recv.ByteRetrans + (recv.PktRetrans * c.statistics.headerSize),
 		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),

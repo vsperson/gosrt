@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt/congestion"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -230,4 +231,45 @@ func TestPktRecvLoss(t *testing.T) {
 
 	require.Equal(t, uint64(len(message)+44), statsWriter.Accumulated.ByteSent)
 	require.Equal(t, uint64(1), statsWriter.Accumulated.PktSent)
+}
+
+type statsSender struct {
+	congestion.Sender
+}
+
+func (s *statsSender) Stats() congestion.SendStats {
+	return congestion.SendStats{}
+}
+
+type statsReceiver struct {
+	congestion.Receiver
+	stats congestion.ReceiveStats
+}
+
+func (r *statsReceiver) Stats() congestion.ReceiveStats {
+	return r.stats
+}
+
+func TestByteRecvLateBelated(t *testing.T) {
+	c := &srtConn{
+		start: time.Now(),
+		snd:   &statsSender{},
+		recv: &statsReceiver{
+			stats: congestion.ReceiveStats{
+				PktLate:     2,
+				ByteLate:    2000,
+				PktBelated:  5,
+				ByteBelated: 5000,
+			},
+		},
+	}
+	c.statistics.headerSize = 44
+
+	s := Statistics{}
+	c.Stats(&s)
+
+	require.Equal(t, uint64(2), s.Accumulated.PktRecvLate)
+	require.Equal(t, uint64(2000+2*44), s.Accumulated.ByteRecvLate)
+	require.Equal(t, uint64(5), s.Accumulated.PktRecvBelated)
+	require.Equal(t, uint64(5000+5*44), s.Accumulated.ByteRecvBelated)
 }
