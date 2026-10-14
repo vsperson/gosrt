@@ -46,6 +46,10 @@ type Receiver interface {
 	// Push pushes a recieved packet to the receiver queue.
 	Push(pkt packet.Packet)
 
+	// PushDropped pushes a received packet to the receiver queue that has to be dropped, e.g. because
+	// it could not be decrypted. It will not be reported as missing and it will not be delivered.
+	PushDropped(pkt packet.Packet)
+
 	// Tick gets called from a connection in order to proceed with queued packets. The provided value for
 	// now is corresponds to the timestamps in the queued packets. Those timestamps are the microseconds
 	// since the start of the connection.

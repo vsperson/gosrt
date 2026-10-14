@@ -29,6 +29,7 @@ type receiver struct {
 	lastACKSequenceNumber       circular.Number
 	lastDeliveredSequenceNumber circular.Number
 	packetList                  *list.List
+	dropped                     map[uint32]struct{} // sequence numbers of packets in packetList that are dropped
 	lock                        sync.RWMutex
 
 	nPackets uint
@@ -77,6 +78,7 @@ func NewReceiver(config ReceiveConfig) congestion.Receiver {
 		lastACKSequenceNumber:       config.InitialSequenceNumber.Dec(),
 		lastDeliveredSequenceNumber: config.InitialSequenceNumber.Dec(),
 		packetList:                  list.New(),
+		dropped:                     map[uint32]struct{}{},
 
 		periodicACKInterval: config.PeriodicACKInterval,
 		periodicNAKInterval: config.PeriodicNAKInterval,
@@ -188,12 +190,27 @@ func (r *receiver) Flush() {
 	defer r.lock.Unlock()
 
 	r.packetList = r.packetList.Init()
+	clear(r.dropped)
 }
 
 func (r *receiver) Push(pkt packet.Packet) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
+	r.push(pkt, false)
+}
+
+func (r *receiver) PushDropped(pkt packet.Packet) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	r.push(pkt, true)
+}
+
+// push puts a packet into the receiver queue. If dropped is true, the packet takes its place in the
+// sequence, such that it will not be reported as missing, but it will not be delivered. The caller
+// must hold the lock.
+func (r *receiver) push(pkt packet.Packet, dropped bool) {
 	if pkt == nil {
 		return
 	}
@@ -248,13 +265,17 @@ func (r *receiver) Push(pkt packet.Packet) {
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
 				// Late arrival, this fills a gap
-				r.statistics.PktBuf++
-				r.statistics.PktUnique++
-				r.statistics.PktLate++
+				if dropped {
+					r.markDropped(pkt)
+				} else {
+					r.statistics.PktBuf++
+					r.statistics.PktUnique++
+					r.statistics.PktLate++
 
-				r.statistics.ByteBuf += pktLen
-				r.statistics.ByteUnique += pktLen
-				r.statistics.ByteLate += pktLen
+					r.statistics.ByteBuf += pktLen
+					r.statistics.ByteUnique += pktLen
+					r.statistics.ByteLate += pktLen
+				}
 
 				r.packetList.InsertBefore(pkt, e)
 
@@ -285,11 +306,15 @@ func (r *receiver) Push(pkt packet.Packet) {
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	}
 
-	r.statistics.PktBuf++
-	r.statistics.PktUnique++
+	if dropped {
+		r.markDropped(pkt)
+	} else {
+		r.statistics.PktBuf++
+		r.statistics.PktUnique++
 
-	r.statistics.ByteBuf += pktLen
-	r.statistics.ByteUnique += pktLen
+		r.statistics.ByteBuf += pktLen
+		r.statistics.ByteUnique += pktLen
+	}
 
 	// Probe Packet Logic for Link Capacity Estimation
 	// Probe packets are sent every 16 packets. Pairs are (0, 1), (16, 17), etc.
@@ -327,6 +352,15 @@ func (r *receiver) Push(pkt packet.Packet) {
 	}
 
 	r.packetList.PushBack(pkt)
+}
+
+// markDropped marks a packet in the queue as dropped. As libsrt, it is counted as dropped right away.
+// The caller must hold the lock.
+func (r *receiver) markDropped(pkt packet.Packet) {
+	r.dropped[pkt.Header().PacketSequenceNumber.Val()] = struct{}{}
+
+	r.statistics.PktDrop++
+	r.statistics.ByteDrop += pkt.Len()
 }
 
 func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Number, lite bool) {
@@ -479,14 +513,20 @@ func (r *receiver) Tick(now uint64) {
 			}
 		}
 
-		// Deliver the packet
-		r.statistics.PktBuf--
-		r.statistics.ByteBuf -= p.Len()
-
 		r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
-
-		r.deliver(p)
 		removeList = append(removeList, e)
+
+		if _, ok := r.dropped[p.Header().PacketSequenceNumber.Val()]; ok {
+			// A dropped packet only held its place in the sequence, it is not delivered
+			delete(r.dropped, p.Header().PacketSequenceNumber.Val())
+			p.Decommission()
+		} else {
+			// Deliver the packet
+			r.statistics.PktBuf--
+			r.statistics.ByteBuf -= p.Len()
+
+			r.deliver(p)
+		}
 
 		// Update expected sequence for next iteration
 		expectedSeq = p.Header().PacketSequenceNumber.Inc()
