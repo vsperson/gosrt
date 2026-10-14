@@ -191,11 +191,18 @@ type Config struct {
 	// Default: 1024
 	WriteQueueSize int
 
-	// BlockOnFullQueue controls behavior when queues are full.
-	// If true: block until space is available (prevents drops, may cause latency)
-	// If false: drop packet immediately (current behavior)
-	// Default: false (for backward compatibility)
+	// BlockOnFullQueue controls the behavior when the read queue is full.
+	// If true: keep the packets that are ready for delivery in the receive buffer until the
+	// application reads them, up to ReadBacklogSize packets. Beyond that the oldest are dropped.
+	// If false: drop the packet immediately.
+	// The network queue never blocks, because it may be shared with other connections.
+	// Default: false
 	BlockOnFullQueue bool
+
+	// ReadBacklogSize is the max. number of packets that are ready for delivery and kept in the
+	// receive buffer while the read queue is full. Only used with BlockOnFullQueue.
+	// Default: 8192
+	ReadBacklogSize int
 }
 
 // DefaultConfig is the default configuration for a SRT connection
@@ -241,6 +248,7 @@ var defaultConfig Config = Config{
 	NetworkQueueSize:      1024,
 	WriteQueueSize:        1024,
 	BlockOnFullQueue:      false,
+	ReadBacklogSize:       8192,
 }
 
 // DefaultConfig returns the default configuration for Dial and Listen.
@@ -528,6 +536,12 @@ func (c *Config) UnmarshalQuery(query string) error {
 		}
 	}
 
+	if s := v.Get("readbacklogsize"); len(s) != 0 {
+		if d, err := strconv.Atoi(s); err == nil {
+			c.ReadBacklogSize = d
+		}
+	}
+
 	return nil
 }
 
@@ -696,6 +710,10 @@ func (c *Config) MarshalQuery() string {
 
 	if c.BlockOnFullQueue != defaultConfig.BlockOnFullQueue {
 		q.Set("blockonfullqueue", strconv.FormatBool(c.BlockOnFullQueue))
+	}
+
+	if c.ReadBacklogSize != defaultConfig.ReadBacklogSize {
+		q.Set("readbacklogsize", strconv.Itoa(c.ReadBacklogSize))
 	}
 
 	return q.Encode()

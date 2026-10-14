@@ -1029,3 +1029,96 @@ func TestRecvPushDroppedFillsGap(t *testing.T) {
 	require.Equal(t, uint64(0), recv.statistics.PktLost)
 	require.Equal(t, uint64(0), recv.statistics.PktBuf)
 }
+
+func TestRecvBacklog(t *testing.T) {
+	numbers := []uint32{}
+	canDeliver := false
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		OnDeliver: func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+		CanDeliver: func() bool { return canDeliver },
+		MaxBacklog: 3,
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(from, to uint32) {
+		for i := from; i < to; i++ {
+			p := packet.NewPacket(addr)
+			p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+			p.Header().PktTsbpdTime = uint64(i + 1)
+
+			recv.Push(p)
+		}
+	}
+
+	// The packets are ready, but can't be delivered. They are kept.
+	push(0, 3)
+	recv.Tick(10)
+
+	require.Equal(t, 0, len(numbers))
+	require.Equal(t, uint64(3), recv.statistics.PktBuf)
+	require.Equal(t, uint64(0), recv.statistics.PktQueueDrop)
+
+	// More packets than the backlog allows, the oldest are dropped
+	push(3, 5)
+	recv.Tick(20)
+
+	require.Equal(t, 0, len(numbers))
+	require.Equal(t, uint64(3), recv.statistics.PktBuf)
+	require.Equal(t, uint64(2), recv.statistics.PktQueueDrop)
+
+	// The application reads again, the rest is delivered in order
+	canDeliver = true
+	recv.Tick(30)
+
+	require.Equal(t, []uint32{2, 3, 4}, numbers)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+	require.Equal(t, uint64(2), recv.statistics.PktQueueDrop)
+	require.Equal(t, uint64(0), recv.statistics.PktLost)
+}
+
+func TestRecvBacklogWithGap(t *testing.T) {
+	numbers := []uint32{}
+	canDeliver := false
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(0, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		OnDeliver: func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+		CanDeliver: func() bool { return canDeliver },
+		MaxBacklog: 2,
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	// 2 is missing
+	for _, i := range []uint32{0, 1, 3, 4, 5} {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	recv.Tick(10)
+
+	// 0, 1 and 3 are dropped from the backlog, 2 is dropped by TLPKTDROP
+	require.Equal(t, 0, len(numbers))
+	require.Equal(t, uint64(3), recv.statistics.PktQueueDrop)
+	require.Equal(t, uint64(1), recv.statistics.PktDrop)
+	require.Equal(t, uint64(1), recv.statistics.PktLost)
+	require.Equal(t, uint64(2), recv.statistics.PktBuf)
+
+	canDeliver = true
+	recv.Tick(20)
+
+	require.Equal(t, []uint32{4, 5}, numbers)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+}
