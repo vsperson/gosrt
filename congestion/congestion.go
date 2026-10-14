@@ -119,7 +119,8 @@ type ReceiveStats struct {
 	PktBelated  uint64
 	ByteBelated uint64
 
-	// The toal number of packets that arrived out of order, but still in time.
+	// The total number of packets that arrived out of order, but still in time, i.e. that filled a gap.
+	// These are reordered original packets as well as retransmitted packets.
 	PktLate  uint64
 	ByteLate uint64
 
@@ -138,6 +139,9 @@ type ReceiveStats struct {
 	PktBuf  uint64
 	ByteBuf uint64
 	MsBuf   uint64
+
+	// The max. distance in sequence numbers of an original (not retransmitted) packet that arrived out of order.
+	PktReorderDistance uint64
 
 	BytePayload uint64
 

@@ -1161,3 +1161,44 @@ func TestRecvBelatedRetransmission(t *testing.T) {
 	require.Equal(t, uint64(0), recv.statistics.PktDrop)
 	require.Equal(t, uint64(5), recv.statistics.PktBuf)
 }
+
+func TestRecvReorderDistance(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, retransmitted bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 100)
+		p.Header().RetransmittedPacketFlag = retransmitted
+
+		recv.Push(p)
+	}
+
+	// 3 and 20 are missing
+	for i := uint32(0); i <= 25; i++ {
+		if i == 3 || i == 20 {
+			continue
+		}
+		push(i, false)
+	}
+
+	require.Equal(t, uint64(0), recv.Stats().PktReorderDistance)
+
+	// The original of 3 arrives out of order
+	push(3, false)
+	require.Equal(t, uint64(22), recv.Stats().PktReorderDistance)
+
+	// A retransmission doesn't count
+	push(20, true)
+	require.Equal(t, uint64(22), recv.Stats().PktReorderDistance)
+
+	// A smaller distance doesn't decrease the value
+	push(30, false)
+	push(28, false)
+	require.Equal(t, uint64(22), recv.Stats().PktReorderDistance)
+
+	// PktLate counts all packets that filled a gap, original or retransmitted
+	require.Equal(t, uint64(3), recv.statistics.PktLate)
+}

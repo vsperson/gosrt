@@ -273,3 +273,20 @@ func TestByteRecvLateBelated(t *testing.T) {
 	require.Equal(t, uint64(5), s.Accumulated.PktRecvBelated)
 	require.Equal(t, uint64(5000+5*44), s.Accumulated.ByteRecvBelated)
 }
+
+func TestPktReorderDistance(t *testing.T) {
+	c := &srtConn{
+		start: time.Now(),
+		snd:   &statsSender{},
+		recv: &statsReceiver{
+			stats: congestion.ReceiveStats{
+				PktReorderDistance: 12,
+			},
+		},
+	}
+
+	s := Statistics{}
+	c.Stats(&s)
+
+	require.Equal(t, uint64(12), s.Interval.PktReorderDistance)
+}

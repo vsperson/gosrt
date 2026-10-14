@@ -268,6 +268,15 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 		r.maxSeenSequenceNumber = pkt.Header().PacketSequenceNumber
 	} else if pkt.Header().PacketSequenceNumber.Lte(r.maxSeenSequenceNumber) {
 		// Out of order, is it a missing piece? put it in the correct position
+
+		// As libsrt, keep track of the max. distance of original packets that arrived out of order.
+		if !pkt.Header().RetransmittedPacketFlag {
+			distance := uint64(r.maxSeenSequenceNumber.Distance(pkt.Header().PacketSequenceNumber))
+			if distance > r.statistics.PktReorderDistance {
+				r.statistics.PktReorderDistance = distance
+			}
+		}
+
 		for e := r.packetList.Front(); e != nil; e = e.Next() {
 			p := e.Value.(packet.Packet)
 

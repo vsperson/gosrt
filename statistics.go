@@ -38,7 +38,7 @@ type StatisticsAccumulated struct {
 	PktRecvKM        uint64 // The total number of received KM (Key Material) control packets
 	UsSndDuration    uint64 // The total accumulated time in microseconds, during which the SRT sender has some data to transmit, including packets that have been sent, but not yet acknowledged
 	PktRecvBelated   uint64 // The total number of packets that arrived too late
-	PktRecvLate      uint64 // The total number of packets that arrived late (out of order) but in time
+	PktRecvLate      uint64 // The total number of packets that arrived late (out of order) but in time, original or retransmitted
 	PktSendDrop      uint64 // The total number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
 	PktRecvDrop      uint64 // The total number of dropped by the SRT receiver and, as a result, not delivered to the upstream application DATA packets
 	PktRecvUndecrypt uint64 // The total number of packets that failed to be decrypted at the receiver side
@@ -81,9 +81,9 @@ type StatisticsInterval struct {
 
 	UsSndDuration uint64 // Accumulated time in microseconds, during which the SRT sender has some data to transmit, including packets that have been sent, but not yet acknowledged
 
-	PktReorderDistance uint64
+	PktReorderDistance uint64 // The max. distance in sequence numbers of an original (not retransmitted) packet that arrived out of order
 	PktRecvBelated     uint64 // Number of packets that arrived too late
-	PktRecvLate        uint64 // Number of packets that arrived late (out of order) but in time
+	PktRecvLate        uint64 // Number of packets that arrived late (out of order) but in time, original or retransmitted
 	PktSndDrop         uint64 // Number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
 	PktRecvDrop        uint64 // Number of dropped by the SRT receiver and, as a result, not delivered to the upstream application DATA packets
 	PktRecvUndecrypt   uint64 // Number of packets that failed to be decrypted at the receiver side
@@ -202,7 +202,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		MbpsSendRate:       float64(s.Accumulated.ByteSent-previous.ByteSent) * 8 / 1024 / 1024 / (float64(interval) / 1000),
 		MbpsRecvRate:       float64(s.Accumulated.ByteRecv-previous.ByteRecv) * 8 / 1024 / 1024 / (float64(interval) / 1000),
 		UsSndDuration:      s.Accumulated.UsSndDuration - previous.UsSndDuration,
-		PktReorderDistance: 0,
+		PktReorderDistance: recv.PktReorderDistance,
 		PktRecvBelated:     s.Accumulated.PktRecvBelated - previous.PktRecvBelated,
 		PktRecvLate:        s.Accumulated.PktRecvLate - previous.PktRecvLate,
 		PktSndDrop:         s.Accumulated.PktSendDrop - previous.PktSendDrop,
