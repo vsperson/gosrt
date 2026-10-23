@@ -15,6 +15,7 @@ import (
 	"github.com/datarhei/gosrt/congestion"
 	"github.com/datarhei/gosrt/congestion/live"
 	"github.com/datarhei/gosrt/crypto"
+	"github.com/datarhei/gosrt/fec"
 	"github.com/datarhei/gosrt/packet"
 )
 
@@ -220,6 +221,10 @@ type srtConn struct {
 	recv congestion.Receiver
 	snd  congestion.Sender
 
+	// FEC
+	fecGen *fec.Generator
+	fecRec *fec.Reconstructor
+
 	// context of all channels and routines
 	ctx       context.Context
 	cancelCtx context.CancelFunc
@@ -330,6 +335,10 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		c.driftTracer = newDriftTracer()
 	}
 
+	if c.config.DriftTracer {
+		c.driftTracer = newDriftTracer()
+	}
+
 	c.peerIdleTimeout = time.AfterFunc(c.config.PeerIdleTimeout, func() {
 		c.log("connection:close", func() string {
 			return fmt.Sprintf("no more data received from peer for %s. shutting down", c.config.PeerIdleTimeout)
@@ -378,6 +387,16 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		OverheadBW:            c.config.OverheadBW,
 		OnDeliver:             c.pop,
 	})
+
+	if len(c.config.PacketFilter) > 0 {
+		fecCfg, err := fec.ParseConfig(c.config.PacketFilter)
+		if err == nil {
+			c.fecGen = fec.NewGenerator(fecCfg)
+			c.fecRec = fec.NewReconstructor(fecCfg)
+		} else {
+			c.log("connection:error", func() string { return fmt.Sprintf("invalid FEC config: %s", err) })
+		}
+	}
 
 	c.ctx, c.cancelCtx = context.WithCancel(context.Background())
 
@@ -637,6 +656,14 @@ func (c *srtConn) pop(p packet.Packet) {
 
 	// Send the packet on the wire
 	c.onSend(p)
+
+	if c.fecGen != nil && !p.Header().IsControlPacket {
+		fecPkts := c.fecGen.AddPacket(p)
+		for _, fecPkt := range fecPkts {
+			c.log("fec:send:dump", func() string { return fecPkt.Dump() })
+			c.onSend(fecPkt)
+		}
+	}
 }
 
 // networkQueueReader reads the packets from the network queue in order to process them.
@@ -756,7 +783,24 @@ func (c *srtConn) handlePacket(p packet.Packet) {
 	// "An FEC control packet is distinguished from a regular data packet by having
 	// its message number equal to 0. This value isn't normally used in SRT (message
 	// numbers start from 1, increment to a maximum, and then roll back to 1)."
-	if header.MessageNumber == 0 {
+	// Process FEC filter
+	if c.fecRec != nil {
+		recoveredPkts := c.fecRec.AddPacket(p)
+
+		if header.MessageNumber == 0 {
+			c.log("connection:filter", func() string { return "processed FEC filter control packet" })
+			for _, recPkt := range recoveredPkts {
+				c.log("connection:filter", func() string { return fmt.Sprintf("recovered packet %d", recPkt.Header().PacketSequenceNumber.Val()) })
+				c.handlePacket(recPkt)
+			}
+			return
+		}
+
+		for _, recPkt := range recoveredPkts {
+			c.log("connection:filter", func() string { return fmt.Sprintf("recovered packet %d", recPkt.Header().PacketSequenceNumber.Val()) })
+			c.handlePacket(recPkt)
+		}
+	} else if header.MessageNumber == 0 {
 		c.log("connection:filter", func() string { return "dropped FEC filter control packet" })
 		return
 	}
@@ -1079,8 +1123,12 @@ func (c *srtConn) handleHSRequest(p packet.Packet) {
 		return
 	}
 
-	if cif.SRTFlags.PACKET_FILTER {
-		c.log("control:recv:HSReq:error", func() string { return "PACKET_FILTER flag is set" })
+	if cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) == 0 {
+		c.log("control:recv:HSReq:error", func() string { return "Peer set PACKET_FILTER but local does not support it" })
+		c.close()
+		return
+	} else if !cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) > 0 {
+		c.log("control:recv:HSReq:error", func() string { return "Local requires PACKET_FILTER but peer did not set it" })
 		c.close()
 		return
 	}
@@ -1169,8 +1217,12 @@ func (c *srtConn) handleHSResponse(p packet.Packet) {
 		return
 	}
 
-	if cif.SRTFlags.PACKET_FILTER {
-		c.log("control:recv:HSReq:error", func() string { return "PACKET_FILTER flag is set" })
+	if cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) == 0 {
+		c.log("control:recv:HSRes:error", func() string { return "Peer set PACKET_FILTER but local does not support it" })
+		c.close()
+		return
+	} else if !cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) > 0 {
+		c.log("control:recv:HSRes:error", func() string { return "Local requires PACKET_FILTER but peer did not set it" })
 		c.close()
 		return
 	}
@@ -1361,8 +1413,7 @@ func (c *srtConn) sendNAK(list []circular.Number) {
 }
 
 // sendACK sends an ACK to the peer with the given sequence number. A full ACK
-// that would only repeat what the peer has already confirmed is dropped, see
-// dropRepeatedACK.
+// that repeats an unchanged sequence is deferred according to dropRepeatedACK.
 func (c *srtConn) sendACK(seq circular.Number, lite bool) {
 	c.ackLock.Lock()
 	defer c.ackLock.Unlock()
@@ -1424,20 +1475,23 @@ func (c *srtConn) sendACK(seq circular.Number, lite bool) {
 	c.pop(p)
 }
 
-// dropRepeatedACK reports whether a full ACK for seq would tell the peer only
-// what it already knows, in which case it is not worth a packet.
+// dropRepeatedACK reports whether a full ACK for seq can be deferred without
+// removing the bounded control traffic that keeps an idle peer reachable.
 //
 // The periodic ACK is paced by a 10 ms timer rather than by traffic, so a
 // connection carrying a couple of packets per second still produces ~100 ACKs
 // per second. Each is 72 bytes on the wire once IPv4 and UDP are counted, and
 // each obliges the sender to answer with a 44 byte ACKACK. On a low bitrate
-// live link — a 1 fps camera on a cellular or satellite uplink, say — that
+// live link (a 1 fps camera on a cellular or satellite uplink, for example) that
 // exchange costs several times what the media does, in both directions.
 //
 // libsrt suppresses the repeats: CUDT::sendCtrlAck() returns early when the
 // sequence number has not advanced since the last ACKACK, and lets the
 // remaining repeats through no more than once per RTT + 4 RTTVar. This is the
-// same rule. Anything that acknowledges new data is always sent.
+// same rule for unconfirmed ACKs. A confirmed repeat is sent at most once per
+// second: gosrt does not initiate idle KEEPALIVE packets, so suppressing every
+// confirmed repeat lets two idle gosrt peers reach their peer-idle deadlines.
+// Anything that acknowledges new data is always sent.
 //
 // The caller must hold ackLock.
 func (c *srtConn) dropRepeatedACK(seq circular.Number) bool {
@@ -1446,11 +1500,11 @@ func (c *srtConn) dropRepeatedACK(seq circular.Number) bool {
 	}
 
 	if c.haveACKedACK && seq.Equals(c.lastACKedACK) {
-		return true // the peer has already confirmed exactly this
+		return time.Since(c.lastSentACKTime) < time.Second
 	}
 
 	// Unconfirmed: either the ACK or its ACKACK may have been lost, so keep
-	// repeating — but at the RTT, not at the 10 ms tick.
+	// repeating at the RTT instead of the 10 ms tick.
 	repeatAfter := time.Duration(c.rtt.RTT()+4*c.rtt.RTTVar()) * time.Microsecond
 
 	return time.Since(c.lastSentACKTime) < repeatAfter
@@ -1466,6 +1520,28 @@ func (c *srtConn) sendACKACK(ackSequence uint32) {
 	p.Header().Timestamp = c.getTimestampForPacket()
 
 	p.Header().TypeSpecific = ackSequence
+
+	// Four bytes of zero padding, to match libsrt.
+	//
+	// An ACKACK carries no control information of its own — the ACK
+	// sequence number travels in the header's Type-specific Information
+	// field above — so by the RFC it needs no payload. libsrt, however,
+	// rejects a control packet with a zero-length payload and logs an
+	// error for every ACKACK it receives:
+	//
+	//	EPE: incoming UMSG: 6 INVALID SIZE: 0
+	//	     (expected > 0 and aligned to 4 bytes)
+	//
+	// At one ACK every 10 ms that is several error lines a second in the
+	// log of every libsrt peer, which buries real transport errors.
+	//
+	// libsrt pads its own ACKACK, KEEPALIVE and SHUTDOWN with a 4-byte
+	// m_extra_pad for the same reason (srtcore/packet.cpp: "control info
+	// field should be none but writev does not allow this"), and this
+	// package already does exactly this for SHUTDOWN, where
+	// CIFShutdown.Marshal writes four zero bytes. This brings ACKACK in
+	// line with both.
+	p.SetData(make([]byte, 4))
 
 	c.log("control:send:ACKACK:dump", func() string { return p.Dump() })
 
@@ -1498,8 +1574,8 @@ func (c *srtConn) sendHSRequest() {
 			TLPKTDROP:     true,  // must be set in live mode
 			PERIODICNAK:   false, // not relevant for us as sender
 			REXMITFLG:     true,  // must alwasy be set
-			STREAM:        false, // has been introducet in HSv5
-			PACKET_FILTER: false, // has been introducet in HSv5
+			STREAM:        false,
+			PACKET_FILTER: len(c.config.PacketFilter) > 0,
 		},
 		RecvTSBPDDelay: 0,
 		SendTSBPDDelay: uint16(c.config.ReceiverLatency.Milliseconds()),
