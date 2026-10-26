@@ -1361,3 +1361,49 @@ func TestRecvFreshLossRanges(t *testing.T) {
 	recv.revokeFreshLoss(n(17))
 	require.Equal(t, [][]uint32{{18, 19, 30}}, ranges())
 }
+
+func TestRecvPeriodicNAKAfterFullInterval(t *testing.T) {
+	naks := []uint64{}
+	now := uint64(0)
+	recv := mockLiveRecv(
+		nil,
+		func(list []circular.Number) {
+			naks = append(naks, now)
+		},
+		nil,
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = 1_000_000
+
+		recv.Push(p)
+	}
+
+	tick := func(t uint64) {
+		now = t
+		recv.Tick(t)
+	}
+
+	// No loss, the NAK interval (20) restarts on every tick
+	push(0)
+	push(1)
+	tick(10)
+	tick(20)
+	tick(30)
+
+	// 2 is missing, immediate NAK
+	now = 35
+	push(3)
+	require.Equal(t, []uint64{35}, naks)
+
+	// The periodic NAK comes only a full interval after the last tick without loss
+	tick(40)
+	require.Equal(t, []uint64{35}, naks)
+
+	tick(50)
+	require.Equal(t, []uint64{35, 50}, naks)
+}

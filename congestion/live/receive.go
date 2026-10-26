@@ -54,6 +54,8 @@ type receiver struct {
 	lastPeriodicACK uint64
 	lastPeriodicNAK uint64
 
+	lossPending bool // whether there's a gap after the last ACK
+
 	avgPayloadSize  float64 // bytes
 	maxLinkCapacity float64 // Mbps, tracks maximum observed receive bandwidth
 
@@ -412,6 +414,7 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 
 	// Find the sequence number up until we have all in a row.
 	// Where the first gap is (or at the end of the list) is where we can ACK to.
+	gap := false
 
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
@@ -435,8 +438,12 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
+		gap = true
+
 		break
 	}
+
+	r.lossPending = gap
 
 	ok = true
 	sequenceNumber = ackSequenceNumber.Inc()
@@ -460,6 +467,12 @@ func (r *receiver) periodicNAK(now uint64) []circular.Number {
 	defer r.lock.RUnlock()
 
 	if now-r.lastPeriodicNAK < r.periodicNAKInterval {
+		// As libsrt, restart the interval as long as nothing is missing. A new gap is reported
+		// periodically only after a full interval, giving the retransmission time to arrive.
+		if !r.lossPending {
+			r.lastPeriodicNAK = now
+		}
+
 		return nil
 	}
 
