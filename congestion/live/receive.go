@@ -399,12 +399,19 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 		}
 	}
 
+	minPktTsbpdTime, maxPktTsbpdTime := uint64(0), uint64(0)
 	ackSequenceNumber := r.lastACKSequenceNumber
+
+	e := r.packetList.Front()
+	if e != nil {
+		p := e.Value.(packet.Packet)
+
+		minPktTsbpdTime = p.Header().PktTsbpdTime
+		maxPktTsbpdTime = p.Header().PktTsbpdTime
+	}
 
 	// Find the sequence number up until we have all in a row.
 	// Where the first gap is (or at the end of the list) is where we can ACK to.
-	// TLPKTDROP: If there are gaps and the next packet's delivery time has passed,
-	// virtually drop the missing packets and continue.
 
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
@@ -414,22 +421,20 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 			continue
 		}
 
+		// If there are packets that should have been delivered by now, move forward.
+		if p.Header().PktTsbpdTime <= now {
+			ackSequenceNumber = p.Header().PacketSequenceNumber
+			continue
+		}
+
 		// Check if the packet is the next in the row.
 		if p.Header().PacketSequenceNumber.Equals(ackSequenceNumber.Inc()) {
 			ackSequenceNumber = p.Header().PacketSequenceNumber
+			maxPktTsbpdTime = p.Header().PktTsbpdTime
+			r.statistics.MsBuf = (maxPktTsbpdTime - minPktTsbpdTime) / 1_000
 			continue
 		}
 
-		// There's a gap. Check if the packet's delivery time has passed (TLPKTDROP).
-		// If so, skip the gap and continue ACK'ing.
-		// The skipped packets are counted as dropped in Tick, when the delivery moves past them.
-		if p.Header().PktTsbpdTime <= now {
-			// Skip the gap and continue with this packet
-			ackSequenceNumber = p.Header().PacketSequenceNumber
-			continue
-		}
-
-		// Delivery time hasn't passed, stop here
 		break
 	}
 
@@ -440,19 +445,12 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 	// packets that come in late that have a lower sequence number.
 	r.lastACKSequenceNumber = ackSequenceNumber
 
+	// Gaps up to the ACK'd sequence number are either filled or skipped (TLPKTDROP).
+	// Either way, they must not be reported anymore.
+	r.revokeFreshLoss(ackSequenceNumber)
+
 	r.lastPeriodicACK = now
 	r.nPackets = 0
-
-	// Calculate MsBuf based on the entire packet list (first to last),
-	// similar to libsrt's getRcvDataSize/getTimespan_ms.
-	// This includes gaps/missing packets in the timespan.
-	if r.packetList.Len() > 0 {
-		first := r.packetList.Front().Value.(packet.Packet)
-		last := r.packetList.Back().Value.(packet.Packet)
-		r.statistics.MsBuf = (last.Header().PktTsbpdTime - first.Header().PktTsbpdTime) / 1_000
-	} else {
-		r.statistics.MsBuf = 0
-	}
 
 	return
 }
@@ -506,32 +504,15 @@ func (r *receiver) Tick(now uint64) {
 		r.sendNAK(list)
 	}
 
-	// Deliver packets whose PktTsbpdTime is ripe.
+	// Deliver packets whose PktTsbpdTime is ripe
 	r.lock.Lock()
+	lastDeliveredSequenceNumber := r.lastDeliveredSequenceNumber
 	removeList := make([]*list.Element, 0, r.packetList.Len())
-	expectedSeq := r.lastDeliveredSequenceNumber.Inc()
 
-	// release removes a ripe packet from the buffer and delivers it. If deliver is false, the packet is dropped
-	// because the application didn't read in time.
+	// release removes a ripe packet from the buffer and delivers it. If deliver is false, the packet is
+	// dropped because the application didn't read in time.
 	release := func(e *list.Element, deliver bool) {
 		p := e.Value.(packet.Packet)
-
-		// Check if there's a gap before the packet.
-		if !p.Header().PacketSequenceNumber.Equals(expectedSeq) {
-			// There's a gap. TLPKTDROP: skip missing packets and continue delivery.
-			// The skipped packets will not be delivered anymore. As libsrt, count them as dropped.
-			skipped := uint64(p.Header().PacketSequenceNumber.Distance(expectedSeq))
-			r.statistics.PktLost += skipped
-			r.statistics.PktDrop += skipped
-			r.statistics.ByteDrop += skipped * uint64(r.avgPayloadSize)
-
-			// Update sequence numbers to skip the gap.
-			r.revokeFreshLoss(p.Header().PacketSequenceNumber.Dec())
-			r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber.Dec()
-			if r.lastACKSequenceNumber.Lt(p.Header().PacketSequenceNumber.Dec()) {
-				r.lastACKSequenceNumber = p.Header().PacketSequenceNumber.Dec()
-			}
-		}
 
 		r.lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
 		removeList = append(removeList, e)
@@ -540,41 +521,38 @@ func (r *receiver) Tick(now uint64) {
 			// A dropped packet only held its place in the sequence, it is not delivered
 			delete(r.dropped, p.Header().PacketSequenceNumber.Val())
 			p.Decommission()
-		} else {
-			r.statistics.PktBuf--
-			r.statistics.ByteBuf -= p.Len()
-
-			if deliver {
-				r.deliver(p)
-			} else {
-				r.statistics.PktQueueDrop++
-				r.statistics.ByteQueueDrop += p.Len()
-
-				p.Decommission()
-			}
+			return
 		}
 
-		// Update expected sequence for next iteration
-		expectedSeq = p.Header().PacketSequenceNumber.Inc()
+		r.statistics.PktBuf--
+		r.statistics.ByteBuf -= p.Len()
+
+		if deliver {
+			r.deliver(p)
+			return
+		}
+
+		r.statistics.PktQueueDrop++
+		r.statistics.ByteQueueDrop += p.Len()
+
+		p.Decommission()
 	}
 
 	var backlog []*list.Element
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		// Check if this packet is ready for delivery (TSBPD)
-		if p.Header().PktTsbpdTime > now {
-			// Not ready yet, stop processing
+		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
+			if backlog != nil || !r.canDeliver() {
+				// The packet is ready, but it can't be delivered now. Keep it until the next tick.
+				backlog = append(backlog, e)
+				continue
+			}
+
+			release(e, true)
+		} else {
 			break
 		}
-
-		if backlog != nil || !r.canDeliver() {
-			// The packet is ready, but it can't be delivered now. Keep it until the next tick.
-			backlog = append(backlog, e)
-			continue
-		}
-
-		release(e, true)
 	}
 
 	if r.maxBacklog != 0 && uint64(len(backlog)) > r.maxBacklog {
@@ -584,8 +562,33 @@ func (r *receiver) Tick(now uint64) {
 		}
 	}
 
-	for _, e := range removeList {
-		r.packetList.Remove(e)
+	// skipped counts packets that have not been delivered because the delivery moved past them (TLPKTDROP).
+	// As libsrt, they are counted as dropped.
+	skipped := func(n uint64) {
+		r.statistics.PktLost += n
+		r.statistics.PktDrop += n
+		r.statistics.ByteDrop += n * uint64(r.avgPayloadSize)
+	}
+
+	if len(removeList) != 0 {
+		// Remove packets from buffer and count the number of actually lost packets
+		for _, e := range removeList {
+			p := e.Value.(packet.Packet)
+
+			distance := lastDeliveredSequenceNumber.Distance(p.Header().PacketSequenceNumber)
+			if distance > 1 {
+				skipped(uint64(distance - 1))
+			}
+
+			lastDeliveredSequenceNumber = p.Header().PacketSequenceNumber
+
+			r.packetList.Remove(e)
+		}
+
+		distance := lastDeliveredSequenceNumber.Distance(r.lastDeliveredSequenceNumber)
+		if distance > 1 {
+			skipped(uint64(distance - 1))
+		}
 	}
 	r.lock.Unlock()
 
