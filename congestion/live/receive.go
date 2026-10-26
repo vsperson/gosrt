@@ -410,6 +410,9 @@ func (r *receiver) periodicACK(now uint64) (ok bool, sequenceNumber circular.Num
 
 		minPktTsbpdTime = p.Header().PktTsbpdTime
 		maxPktTsbpdTime = p.Header().PktTsbpdTime
+	} else {
+		// As libsrt, an empty buffer has a span of 0
+		r.statistics.MsBuf = 0
 	}
 
 	// Find the sequence number up until we have all in a row.

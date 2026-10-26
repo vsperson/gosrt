@@ -1407,3 +1407,27 @@ func TestRecvPeriodicNAKAfterFullInterval(t *testing.T) {
 	tick(50)
 	require.Equal(t, []uint64{35, 50}, naks)
 }
+
+func TestRecvMsBufEmpty(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for i := uint32(0); i < 5; i++ {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(100_000 + i*10_000)
+
+		recv.Push(p)
+	}
+
+	recv.Tick(10)
+	require.Equal(t, uint64(40), recv.Stats().MsBuf)
+
+	// All packets are delivered, the buffer is empty
+	recv.Tick(200_000)
+	require.Equal(t, uint64(0), recv.Stats().PktBuf)
+
+	recv.Tick(200_020)
+	require.Equal(t, uint64(0), recv.Stats().MsBuf)
+}
