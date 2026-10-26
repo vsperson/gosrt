@@ -335,10 +335,6 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		c.driftTracer = newDriftTracer()
 	}
 
-	if c.config.DriftTracer {
-		c.driftTracer = newDriftTracer()
-	}
-
 	c.peerIdleTimeout = time.AfterFunc(c.config.PeerIdleTimeout, func() {
 		c.log("connection:close", func() string {
 			return fmt.Sprintf("no more data received from peer for %s. shutting down", c.config.PeerIdleTimeout)
