@@ -10,6 +10,10 @@ import (
 // number of packets arrived and the gap is still not filled. The reorder tolerance starts with the max. value
 // (LossMaxTTL). It is increased up to that value if an original packet arrives out of order, and it is decreased
 // as long as packets arrive in order.
+//
+// Unlike libsrt, the ranges of missing packets are maintained further if the tolerance decreased to 0. libsrt
+// leaves them untouched until the tolerance increases again, and then it may send a NAK for packets that already
+// arrived or were dropped in the meantime.
 
 // freshLoss is a range of missing packets that is reported with a NAK after ttl more packets arrived.
 type freshLoss struct {
@@ -66,10 +70,9 @@ func (r *receiver) inserted(inOrder bool) {
 }
 
 // unlose is called for a packet that arrived with a sequence number lower than the highest received sequence
-// number, i.e. it filled a gap or it's a redundant copy. If it's an original packet, the reorder tolerance is
-// adjusted. If the packet has been added to the buffer, it is removed from the ranges of missing packets.
-// The caller must hold the lock.
-func (r *receiver) unlose(pkt packet.Packet, inserted bool) {
+// number, i.e. it filled a gap or it's a redundant copy. It is removed from the ranges of missing packets and,
+// if it's an original packet, the reorder tolerance is adjusted. The caller must hold the lock.
+func (r *receiver) unlose(pkt packet.Packet) {
 	original := !pkt.Header().RetransmittedPacketFlag
 	increasedTolerance := false
 
@@ -83,10 +86,6 @@ func (r *receiver) unlose(pkt packet.Packet, inserted bool) {
 			r.reorderTolerance = uint32(min(distance, uint64(r.maxReorderTolerance)))
 			increasedTolerance = true
 		}
-	}
-
-	if !inserted {
-		return
 	}
 
 	hadTTL := r.removeFreshLoss(pkt.Header().PacketSequenceNumber)

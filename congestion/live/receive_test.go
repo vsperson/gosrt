@@ -1431,3 +1431,86 @@ func TestRecvMsBufEmpty(t *testing.T) {
 	recv.Tick(200_020)
 	require.Equal(t, uint64(0), recv.Stats().MsBuf)
 }
+
+func TestRecvReorderToleranceDuplicate(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := mockReorderRecv(30, &nakList)
+
+	seq := uint32(0)
+	for ; seq < 40; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	// A retransmitted duplicate doesn't interrupt the packets in order
+	pushSeq(recv, 20, true)
+
+	for ; seq < 50; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	require.Equal(t, uint64(29), recv.Stats().PktReorderTolerance)
+
+	for ; seq < 90; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	// An original duplicate does, as in libsrt
+	pushSeq(recv, 70, false)
+
+	for ; seq < 110; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	require.Equal(t, uint64(29), recv.Stats().PktReorderTolerance)
+
+	for ; seq < 140; seq++ {
+		pushSeq(recv, seq, false)
+	}
+
+	require.Equal(t, uint64(28), recv.Stats().PktReorderTolerance)
+	require.Equal(t, uint64(0), recv.statistics.PktDrop) // As libsrt, duplicates are not counted
+	require.Equal(t, 0, len(nakList))
+}
+
+func TestRecvReorderToleranceSequenceWrap(t *testing.T) {
+	nakList := [][]uint32{}
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(packet.MAX_SEQUENCENUMBER-20, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		ReorderTolerance:      30,
+		OnSendNAK: func(list []circular.Number) {
+			l := []uint32{}
+			for _, n := range list {
+				l = append(l, n.Val())
+			}
+			nakList = append(nakList, l)
+		},
+	}).(*receiver)
+
+	seq := func(i uint32) uint32 { return (packet.MAX_SEQUENCENUMBER - 20 + i) & packet.MAX_SEQUENCENUMBER }
+
+	// Across the wrap of the sequence number: one packet arrives 10 packets late, one doesn't arrive at all
+	for i := uint32(0); i <= 60; i++ {
+		if i == 15 || i == 25 {
+			continue
+		}
+		pushSeq(recv, seq(i), false)
+		if i == 25 {
+			continue
+		}
+		if i == 26 {
+			pushSeq(recv, seq(15), false)
+		}
+	}
+
+	require.Equal(t, uint64(2), recv.statistics.PktLoss)
+	require.Equal(t, uint64(11), recv.statistics.PktReorderDistance)
+
+	// Only the packet that never arrived is reported, after the reorder tolerance
+	require.Equal(t, [][]uint32{{seq(25), seq(25)}}, nakList)
+
+	// The ACK moves past the wrap and revokes nothing that is still pending
+	recv.Tick(10)
+	require.Equal(t, 0, len(recv.freshLoss))
+}

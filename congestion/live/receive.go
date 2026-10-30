@@ -17,7 +17,7 @@ type ReceiveConfig struct {
 	InitialSequenceNumber circular.Number
 	PeriodicACKInterval   uint64 // microseconds
 	PeriodicNAKInterval   uint64 // microseconds
-	ReorderTolerance      uint32 // packets
+	ReorderTolerance      uint32 // packets, max. reorder tolerance (SRTO_LOSSMAXTTL)
 	OnSendACK             func(seq circular.Number, light bool)
 	OnSendNAK             func(list []circular.Number)
 	OnDeliver             func(p packet.Packet)
@@ -284,7 +284,7 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
 				// Already received, this is a redundant copy. As libsrt, it is ignored without counting
 				// it, neither as belated nor as dropped.
-				r.unlose(pkt, false)
+				r.unlose(pkt)
 
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {
@@ -303,7 +303,7 @@ func (r *receiver) push(pkt packet.Packet, dropped bool) {
 
 				r.packetList.InsertBefore(pkt, e)
 
-				r.unlose(pkt, true)
+				r.unlose(pkt)
 
 				// A retransmitted packet counts as sent in order, an original packet has been reordered.
 				r.inserted(pkt.Header().RetransmittedPacketFlag)
