@@ -1514,3 +1514,63 @@ func TestRecvReorderToleranceSequenceWrap(t *testing.T) {
 	recv.Tick(10)
 	require.Equal(t, 0, len(recv.freshLoss))
 }
+
+func TestRecvBacklogDroppedPackets(t *testing.T) {
+	canDeliver := false
+	numbers := []uint32{}
+	recv := NewReceiver(ReceiveConfig{
+		InitialSequenceNumber: circular.New(100, packet.MAX_SEQUENCENUMBER),
+		PeriodicACKInterval:   10,
+		PeriodicNAKInterval:   20,
+		CanDeliver:            func() bool { return canDeliver },
+		MaxBacklog:            5,
+		OnDeliver: func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	}).(*receiver)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, dropped bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i)
+
+		if dropped {
+			recv.PushDropped(p)
+		} else {
+			recv.Push(p)
+		}
+	}
+
+	// Packets that are already dropped don't take the place of packets that wait for delivery
+	seq := uint32(100)
+	for ; seq < 103; seq++ {
+		push(seq, false)
+	}
+	for ; seq < 113; seq++ {
+		push(seq, true)
+	}
+
+	recv.Tick(1000)
+	require.Equal(t, uint64(0), recv.statistics.PktQueueDrop)
+
+	// With more packets than allowed, only as many as necessary are dropped, the oldest first
+	for ; seq < 118; seq++ {
+		push(seq, false)
+	}
+
+	recv.Tick(2000)
+	require.Equal(t, uint64(3), recv.statistics.PktQueueDrop)
+
+	canDeliver = true
+	recv.Tick(3000)
+
+	require.Equal(t, []uint32{113, 114, 115, 116, 117}, numbers)
+	require.Equal(t, uint64(3), recv.statistics.PktQueueDrop)
+	require.Equal(t, uint64(10), recv.statistics.PktDrop)
+	require.Equal(t, uint64(0), recv.statistics.PktLost)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+	require.Equal(t, 0, len(recv.dropped))
+	require.Equal(t, 0, recv.packetList.Len())
+}

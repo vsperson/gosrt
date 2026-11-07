@@ -581,9 +581,30 @@ func (r *receiver) Tick(now uint64) {
 		}
 	}
 
-	if r.maxBacklog != 0 && uint64(len(backlog)) > r.maxBacklog {
+	if r.maxBacklog != 0 {
+		// Packets that are already dropped only hold their place, they don't count as waiting for delivery
+		isDropped := func(e *list.Element) bool {
+			_, ok := r.dropped[e.Value.(packet.Packet).Header().PacketSequenceNumber.Val()]
+			return ok
+		}
+
+		waiting := uint64(0)
+		for _, e := range backlog {
+			if !isDropped(e) {
+				waiting++
+			}
+		}
+
 		// Too many packets are waiting for delivery, drop the oldest
-		for _, e := range backlog[:uint64(len(backlog))-r.maxBacklog] {
+		for _, e := range backlog {
+			if waiting <= r.maxBacklog {
+				break
+			}
+
+			if !isDropped(e) {
+				waiting--
+			}
+
 			release(e, false)
 		}
 	}
