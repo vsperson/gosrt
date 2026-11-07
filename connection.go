@@ -916,8 +916,12 @@ func (c *srtConn) handlePacket(p packet.Packet) {
 			return fmt.Sprintf("dropped packet %d, it can't be decrypted", header.PacketSequenceNumber.Val())
 		})
 
-		// Put the packet into receive congestion control, such that it holds its place in the sequence
-		c.recv.PushDropped(p)
+		// The packet holds its place in the sequence, it is neither reported as missing nor delivered
+		if dropper, ok := c.recv.(congestion.ReceiverPacketDropper); ok {
+			dropper.PushDropped(p)
+		} else {
+			p.Decommission()
+		}
 
 		return
 	}
