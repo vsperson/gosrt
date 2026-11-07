@@ -148,7 +148,7 @@ func (c *srtConn) Stats(s *Statistics) {
 	// Accumulated
 	s.Accumulated = StatisticsAccumulated{
 		PktSent:           send.Pkt,
-		PktRecv:           recv.Pkt + c.statistics.pktRecvUndecrypt,
+		PktRecv:           recv.Pkt,
 		PktSentUnique:     send.PktUnique,
 		PktRecvUnique:     recv.PktUnique,
 		PktSendLoss:       send.PktLoss,
@@ -171,7 +171,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
 		PktQueueDrop:      c.statistics.pktQueueDrop + recv.PktQueueDrop,
 		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
-		ByteRecv:          recv.Byte + c.statistics.byteRecvUndecrypt + ((recv.Pkt + c.statistics.pktRecvUndecrypt) * c.statistics.headerSize),
+		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
 		ByteSentUnique:    send.ByteUnique + (send.PktUnique * c.statistics.headerSize),
 		ByteRecvUnique:    recv.ByteUnique + (recv.PktUnique * c.statistics.headerSize),
 		ByteRecvLoss:      recv.ByteLoss + (recv.PktLoss * c.statistics.headerSize),
