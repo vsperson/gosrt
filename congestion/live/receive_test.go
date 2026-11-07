@@ -1157,6 +1157,100 @@ func TestRecvPushDroppedFillsGap(t *testing.T) {
 	require.Equal(t, uint64(0), recv.statistics.PktBuf)
 }
 
+func TestRecvPushDroppedLateCopies(t *testing.T) {
+	ack := uint32(0)
+	numbers := []uint32{}
+	recv := mockLiveRecv(
+		func(seq circular.Number, light bool) {
+			ack = seq.Val()
+		},
+		nil,
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, dropped bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = 1000
+
+		if dropped {
+			recv.PushDropped(p)
+		} else {
+			recv.Push(p)
+		}
+	}
+
+	push(0, false)
+	push(1, true)
+	push(1, false) // A good copy doesn't bring the dropped packet back
+	push(0, true)  // A bad copy doesn't drop a packet that has already been received
+	push(2, false)
+
+	recv.Tick(10)
+	require.Equal(t, uint32(3), ack)
+
+	push(1, true) // The same below the ACK
+
+	recv.Tick(2000)
+	require.Equal(t, []uint32{0, 2}, numbers)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+	require.Equal(t, 0, recv.packetList.Len())
+	require.Equal(t, 0, len(recv.dropped))
+}
+
+func TestRecvPushDroppedNextToSkippedGap(t *testing.T) {
+	ack := uint32(0)
+	numbers := []uint32{}
+	recv := mockLiveRecv(
+		func(seq circular.Number, light bool) {
+			ack = seq.Val()
+		},
+		nil,
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	push := func(i uint32, dropped bool) {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(i, packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = 1000
+
+		if dropped {
+			recv.PushDropped(p)
+		} else {
+			recv.Push(p)
+		}
+	}
+
+	push(0, false)
+	push(2, true) // 1 is missing and will be skipped
+
+	recv.Tick(2000)
+	recv.Tick(2010)
+	require.Equal(t, uint32(3), ack)
+	require.Equal(t, []uint32{0}, numbers)
+	require.Equal(t, uint64(1), recv.statistics.PktLost)
+	require.Equal(t, uint64(2), recv.statistics.PktDrop)
+
+	// The dropped packet is not counted as lost when the stream goes on
+	push(3, false)
+
+	recv.Tick(2020)
+	recv.Tick(2030)
+	require.Equal(t, []uint32{0, 3}, numbers)
+	require.Equal(t, uint64(1), recv.statistics.PktLost)
+	require.Equal(t, uint64(0), recv.statistics.PktBuf)
+	require.Equal(t, 0, recv.packetList.Len())
+	require.Equal(t, 0, len(recv.dropped))
+}
+
 func TestRecvBacklog(t *testing.T) {
 	numbers := []uint32{}
 	canDeliver := false
